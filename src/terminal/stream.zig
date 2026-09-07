@@ -107,6 +107,7 @@ pub const Action = union(Key) {
     kitty_keyboard_set: KittyKeyboardFlags,
     kitty_keyboard_set_or: KittyKeyboardFlags,
     kitty_keyboard_set_not: KittyKeyboardFlags,
+    kitty_multiple_cursors: kitty.cursors.Command,
     dcs_hook: Parser.Action.DCS,
     dcs_put: u8,
     dcs_unhook,
@@ -215,6 +216,7 @@ pub const Action = union(Key) {
             "kitty_keyboard_set",
             "kitty_keyboard_set_or",
             "kitty_keyboard_set_not",
+            "kitty_multiple_cursors",
             "dcs_hook",
             "dcs_put",
             "dcs_unhook",
@@ -2291,6 +2293,14 @@ pub fn Stream(comptime H: type) type {
                             );
                         },
                     },
+
+                    // Kitty multiple cursors protocol (CSI > ... SP q).
+                    // Decoding fails on an unrelated pair of
+                    // intermediates and on an operation we don't
+                    // implement, so the warning logs the whole sequence.
+                    2 => if (kitty.cursors.Command.decode(input)) |command| {
+                        self.handler.vt(.kitty_multiple_cursors, command);
+                    } else log.warn("ignoring unimplemented CSI q: {f}", .{input}),
 
                     else => log.warn(
                         "ignoring unimplemented CSI q with intermediates: {s}",

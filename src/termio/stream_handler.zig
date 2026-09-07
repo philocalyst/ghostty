@@ -320,6 +320,7 @@ pub const StreamHandler = struct {
             .device_attributes => try self.deviceAttributes(value),
             .device_status => try self.deviceStatusReport(value.request),
             .kitty_keyboard_query => try self.queryKittyKeyboard(),
+            .kitty_multiple_cursors => try self.kittyMultipleCursors(value),
             .kitty_keyboard_push => {
                 log.debug("pushing kitty keyboard mode: {}", .{value.flags});
                 self.terminal.screens.active.kitty_keyboard.push(value.flags);
@@ -953,6 +954,28 @@ pub const StreamHandler = struct {
                 .len = @intCast(resp.len),
             },
         });
+    }
+
+    /// Route a kitty multiple cursors command. Updates go to the
+    /// terminal, which supplies the main cursor position coordinate
+    /// type 0 needs. Queries are answered on the pty in arrival order,
+    /// like every other report this handler writes.
+    fn kittyMultipleCursors(
+        self: *StreamHandler,
+        command: terminal.kitty.cursors.Command,
+    ) !void {
+        switch (command) {
+            .update => |update| try self.terminal.kittyMultipleCursors(update),
+
+            .query => |query| {
+                const resp = try self.terminal.kitty_extra_cursors
+                    .allocResponse(self.alloc, query);
+                defer self.alloc.free(resp);
+                self.messageWriter(
+                    try termio.Message.writeReq(self.alloc, resp),
+                );
+            },
+        }
     }
 
     pub fn reportXtversion(

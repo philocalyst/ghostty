@@ -16,6 +16,7 @@ const color = @import("color.zig");
 const modes = @import("modes.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
+const kitty = @import("kitty.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const paste_pkg = @import("paste.zig");
@@ -773,6 +774,7 @@ pub const Handler = struct {
             .device_status => self.deviceStatus(value.request),
             .enquiry => self.reportEnquiry(),
             .kitty_keyboard_query => self.queryKittyKeyboard(),
+            .kitty_multiple_cursors => try self.kittyMultipleCursors(value),
             .request_mode => self.requestMode(value.mode),
             .request_mode_unknown => self.requestModeUnknown(value.mode, value.ansi),
             .size_report => self.reportSize(value),
@@ -1930,6 +1932,24 @@ pub const Handler = struct {
             self.terminal.screens.active.kitty_keyboard.current().int(),
         }) catch return;
         self.writePty(resp);
+    }
+
+    fn kittyMultipleCursors(
+        self: *Handler,
+        command: kitty.cursors.Command,
+    ) !void {
+        switch (command) {
+            .update => |update| try self.terminal.kittyMultipleCursors(update),
+
+            .query => |query| {
+                var stack = std.heap.stackFallback(256, self.terminal.gpa());
+                const alloc = stack.get();
+                const resp = try self.terminal.kitty_extra_cursors
+                    .allocResponse(alloc, query);
+                defer alloc.free(resp);
+                self.writePty(resp);
+            },
+        }
     }
 
     inline fn horizontalTab(self: *Handler, count: u16) void {
