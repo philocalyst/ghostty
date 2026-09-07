@@ -4402,6 +4402,7 @@ test "stream: too many csi params" {
 test "stream: CSI subparameters only reach the finals that define them" {
     const H = struct {
         pos: ?Action.CursorPos = null,
+        cursors: bool = false,
 
         pub fn vt(
             self: *@This(),
@@ -4410,6 +4411,7 @@ test "stream: CSI subparameters only reach the finals that define them" {
         ) void {
             switch (action) {
                 .cursor_pos => self.pos = value,
+                .kitty_multiple_cursors => self.cursors = true,
                 else => {},
             }
         }
@@ -4420,6 +4422,12 @@ test "stream: CSI subparameters only reach the finals that define them" {
     var s: Stream(H) = .init(.{ .handler = .{} });
     s.nextSlice("\x1B[1:2H");
     try testing.expect(s.handler.pos == null);
+
+    // The same colon means something to the kitty cursors protocol. This
+    // also covers the stream's own CSI fast path, which builds the
+    // dispatch without going through the parser state machine.
+    s.nextSlice("\x1B[>1;2:1:1 q");
+    try testing.expect(s.handler.cursors);
 }
 
 test "stream: csi param too long" {
