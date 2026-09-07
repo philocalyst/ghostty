@@ -719,3 +719,190 @@ pub const State = struct {
         if (self.generation == 0) self.generation = 1;
     }
 };
+
+/// Build an `Update` over `params`, with a colon separator after every
+/// parameter whose index appears in `colons`.
+fn testUpdate(
+    operation: Operation,
+    comptime params: []const u16,
+    comptime colons: []const usize,
+) Update {
+    const seps = comptime seps: {
+        var list: Parser.Action.CSI.SepList = .initEmpty();
+        for (colons) |i| list.set(i);
+        break :seps list;
+    };
+    return .{
+        .operation = operation,
+        .params = params,
+        .params_sep = &seps,
+    };
+}
+
+test "Update: regions" {
+    // `1 ; 2:1:2 ; 0 ; 4:2:2:3:3 ; 7:1 ; 4`: a point, the main cursor,
+    // a rectangle, an unknown coordinate type, then a bare rectangle.
+    var it = testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 2, 1, 2, 0, 4, 2, 2, 3, 3, 7, 1, 4 },
+        &.{ 1, 2, 5, 6, 7, 8, 10 },
+    ).regions();
+
+    for ([_]Region{
+        .{ .rect = .{ .top = 1, .left = 2, .bottom = 1, .right = 2 } },
+        .cursor,
+        .{ .rect = .{ .top = 2, .left = 2, .bottom = 3, .right = 3 } },
+        .{ .rect = RegionIterator.all },
+    }) |expected| try testing.expectEqualDeep(expected, it.next().?);
+    try testing.expect(it.next() == null);
+}
+
+test "Update: incomplete coordinates are ignored" {
+    // A trailing point missing its column, then a trailing rectangle
+    // missing its last edge. Neither completes, so neither is yielded.
+    var it = testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 2, 1, 1, 3, 4, 1, 1, 2, 2, 5 },
+        &.{ 1, 2, 3, 5, 6, 7, 8, 9 },
+    ).regions();
+
+    try testing.expectEqualDeep(
+        Region{ .rect = .{ .top = 1, .left = 1, .bottom = 1, .right = 1 } },
+        it.next().?,
+    );
+    try testing.expectEqualDeep(
+        Region{ .rect = .{ .top = 1, .left = 1, .bottom = 2, .right = 2 } },
+        it.next().?,
+    );
+    try testing.expect(it.next() == null);
+}
+
+test "Update: only a bare rectangle type means the whole screen" {
+    // `4` alone is the whole screen. `4:1:2:3` is an incomplete
+    // rectangle, and the spec says to ignore those. Reading it as the
+    // whole screen would paint over everything.
+    var bare = testUpdate(.{ .paint = .block }, &.{ 1, 4 }, &.{}).regions();
+    try testing.expectEqualDeep(
+        Region{ .rect = RegionIterator.all },
+        bare.next().?,
+    );
+    try testing.expect(bare.next() == null);
+
+    var partial = testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 4, 1, 2, 3 },
+        &.{ 1, 2, 3 },
+    ).regions();
+    try testing.expect(partial.next() == null);
+}
+
+test "Command: decode" {
+    const seps: Parser.Action.CSI.SepList = .initEmpty();
+    const S = struct {
+        fn csi(
+            intermediates: []const u8,
+            params: []const u16,
+            final: u8,
+            sep: *const Parser.Action.CSI.SepList,
+        ) Parser.Action.CSI {
+            return .{
+                .intermediates = intermediates,
+                .params = params,
+                .params_sep = sep,
+                .final = final,
+            };
+        }
+    };
+
+    try testing.expectEqual(
+        Query.support,
+        Command.decode(S.csi("> ", &.{}, 'q', &seps)).?.query,
+    );
+    try testing.expectEqual(
+        Query.cursors,
+        Command.decode(S.csi("> ", &.{100}, 'q', &seps)).?.query,
+    );
+    try testing.expectEqual(
+        Query.colors,
+        Command.decode(S.csi("> ", &.{101}, 'q', &seps)).?.query,
+    );
+
+    // A lone paint operation is an update, not a query.
+    try testing.expectEqual(
+        Operation{ .paint = .block },
+        Command.decode(S.csi("> ", &.{1}, 'q', &seps)).?.update.operation,
+    );
+    try testing.expectEqual(
+        Operation.text_color,
+        Command.decode(S.csi("> ", &.{ 30, 0 }, 'q', &seps)).?.update.operation,
+    );
+
+    // ...but one with no coordinate groups targets nothing.
+    var bare = Command.decode(S.csi("> ", &.{1}, 'q', &seps)).?.update.regions();
+    try testing.expect(bare.next() == null);
+
+    // Not this protocol: the wrong final byte, the wrong intermediates
+    // (that one is DECSCUSR), or an operation we don't implement.
+    try testing.expect(Command.decode(S.csi("> ", &.{1}, 'p', &seps)) == null);
+    try testing.expect(Command.decode(S.csi(" ", &.{1}, 'q', &seps)) == null);
+    try testing.expect(Command.decode(S.csi("> ", &.{99}, 'q', &seps)) == null);
+}
+
+test "Command: C value" {
+    const query = (Command{ .query = .colors }).cval();
+    try testing.expectEqual(Command.C.Kind.query_colors, query.kind);
+    try testing.expectEqual(0, query.params_len);
+
+    const params = [_]u16{ 29, 2, 1, 1, 2, 2, 2 };
+    const update = (Command{
+        .update = testUpdate(.{ .paint = .follow }, &params, &.{ 1, 2, 4, 5 }),
+    }).cval();
+
+    try testing.expectEqual(Command.C.Kind.paint, update.kind);
+    try testing.expectEqual(Shape.follow, update.shape);
+    try testing.expectEqualSlices(
+        u16,
+        &params,
+        update.params[0..update.params_len],
+    );
+
+    // Parameters 1, 2, 4 and 5 are followed by ':'.
+    try testing.expectEqual(@as(u8, 0b0011_0110), update.params_sep[0]);
+    try testing.expect(std.mem.allEqual(u8, update.params_sep[1..], 0));
+}
+
+test "Color: decode and encode" {
+    const cases = .{
+        .{ @as(u16, 0), &[_]u16{}, Color.unset, "0" },
+        .{ @as(u16, 1), &[_]u16{}, Color.special, "1" },
+        .{
+            @as(u16, 2),
+            &[_]u16{ 274, 564, 854 },
+            Color.rgb(0x12, 0x34, 0x56),
+            "2:18:52:86",
+        },
+        .{
+            @as(u16, 5),
+            &[_]u16{263},
+            Color{ .value = .{ .palette = 7 } },
+            "5:7",
+        },
+    };
+
+    // The payloads above are all wider than a byte. Truncate them;
+    // don't reject them.
+    inline for (cases) |case| {
+        const decoded = Color.decode(case[0], case[1]).?;
+        try testing.expect(decoded.eql(case[2]));
+
+        var buf: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try decoded.encode(&w);
+        try testing.expectEqualStrings(case[3], w.buffered());
+    }
+
+    // Truncated payloads and unknown color spaces decode to nothing.
+    try testing.expect(Color.decode(2, &.{ 1, 2 }) == null);
+    try testing.expect(Color.decode(5, &.{}) == null);
+    try testing.expect(Color.decode(9, &.{}) == null);
+}
