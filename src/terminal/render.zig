@@ -16,6 +16,7 @@ const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Style = @import("style.zig").Style;
 const Terminal = @import("Terminal.zig");
+const kitty_cursors = @import("kitty/cursors.zig");
 
 // Developer note: this is in src/terminal and not src/renderer because
 // the goal is that this remains generic to multiple renderers. This can
@@ -134,6 +135,10 @@ pub const RenderState = struct {
     /// Cursor state within the viewport.
     cursor: Cursor,
 
+    /// The kitty multiple cursors protocol's cursors, already translated
+    /// into viewport coordinates. See `ExtraCursors`.
+    extra_cursors: ExtraCursors,
+
     /// The captured rows, from top to bottom.
     ///
     /// Without overscan this has exactly `rows` entries and the index is
@@ -218,9 +223,31 @@ pub const RenderState = struct {
             .visible = true,
             .blinking = false,
         },
+        .extra_cursors = .{},
         .row_data = .empty,
         .dirty = .false,
         .screen = .primary,
+    };
+
+    /// The extra cursors of the kitty multiple cursors protocol.
+    pub const ExtraCursors = struct {
+        /// The cursors within the viewport, as an owned snapshot that
+        /// stays valid after the terminal lock is released. Cursors
+        /// outside the viewport are dropped, so this is empty whenever
+        /// the protocol isn't in use.
+        ///
+        /// Positions here are viewport-relative. The terminal's own copy
+        /// is in active-area coordinates.
+        list: std.ArrayListUnmanaged(kitty_cursors.Cursor) = .empty,
+
+        /// The terminal mutation stamp `list` was built from. An
+        /// unchanged stamp means the snapshot needs no rebuild.
+        generation: u64 = 0,
+
+        /// The colors every extra cursor shares (kitty operations 40 and
+        /// 30). `.unset` means "use the main cursor's colors".
+        cursor_color: kitty_cursors.Color = .unset,
+        text_color: kitty_cursors.Color = .unset,
     };
 
     /// The color state for the terminal.
@@ -466,6 +493,7 @@ pub const RenderState = struct {
         }
         self.row_data.deinit(alloc);
         self.pending_styles.deinit(alloc);
+        self.extra_cursors.list.deinit(alloc);
     }
 
     /// Update the render state to the latest terminal state.
@@ -637,6 +665,60 @@ pub const RenderState = struct {
                 self.colors.background = bg;
                 self.colors.foreground = fg;
             }
+        }
+
+        // Snapshot the extra cursors of the kitty multiple cursors
+        // protocol. The copy outlives the terminal lock, and the
+        // terminal's mutation stamp keeps an unchanged frame from doing
+        // any work here at all.
+        const extras = &t.kitty_extra_cursors;
+        self.extra_cursors.text_color = extras.text_color;
+        self.extra_cursors.cursor_color = extras.cursor_color;
+        const extra_cursors_changed =
+            self.extra_cursors.generation != extras.generation;
+        if (extra_cursors_changed or redraw) rebuild: {
+            // Fast path: the protocol isn't in use, so we never have to
+            // work out where the viewport is.
+            if (extras.count == 0) {
+                self.extra_cursors.list.clearRetainingCapacity();
+                self.extra_cursors.generation = extras.generation;
+                break :rebuild;
+            }
+
+            // Reserve before clearing. An OOM then leaves the previous
+            // snapshot and its generation intact, and a later frame
+            // retries.
+            try self.extra_cursors.list.ensureTotalCapacity(
+                alloc,
+                extras.count,
+            );
+            self.extra_cursors.list.clearRetainingCapacity();
+
+            // Cursors are stored in active-area coordinates. Active row
+            // y sits at viewport row y + (active top - viewport top);
+            // the offset is zero unless the user scrolled back.
+            const scroll: i64 = scroll: {
+                const vp = s.pages.pointFromPin(.screen, viewport_pin) orelse
+                    break :scroll 0;
+                const active = s.pages.pointFromPin(
+                    .screen,
+                    s.pages.getTopLeft(.active),
+                ) orelse break :scroll 0;
+                break :scroll @as(i64, active.screen.y) - @as(i64, vp.screen.y);
+            };
+
+            var it = extras.iterator();
+            while (it.next()) |extra| {
+                const y: i64 = @as(i64, extra.y) + scroll;
+                if (y < 0 or y >= self.rows or extra.x >= self.cols) continue;
+                self.extra_cursors.list.appendAssumeCapacity(.{
+                    .shape = extra.shape,
+                    .x = extra.x,
+                    .y = @intCast(y),
+                });
+            }
+
+            self.extra_cursors.generation = extras.generation;
         }
 
         // Ensure our row length is exactly our height plus requested
@@ -953,7 +1035,7 @@ pub const RenderState = struct {
 
             // Note: we don't clear any row_data here because our rebuild
             // above did this.
-        } else if (any_dirty and self.dirty == .false) {
+        } else if ((any_dirty or extra_cursors_changed) and self.dirty == .false) {
             self.dirty = .partial;
         }
 
