@@ -5787,6 +5787,26 @@ pub const TerminalColor = union(enum) {
         };
     }
 
+    /// Resolve to a concrete color against the cell this applies to.
+    ///
+    /// `fallback` covers two cases: an unset option, and one that names
+    /// a cell color when there is no cell. That second case is how a
+    /// cursor outside the viewport still gets a color. The optional goes
+    /// in directly, so this is called as `TerminalColor.resolve(cfg,
+    /// ...)` and not as a method.
+    pub fn resolve(
+        self_: ?TerminalColor,
+        cell: ?terminal.color.Pair,
+        fallback: terminal.color.RGB,
+    ) terminal.color.RGB {
+        const self = self_ orelse return fallback;
+        return switch (self) {
+            .color => |v| v.toTerminalRGB(),
+            .@"cell-foreground" => if (cell) |v| v.foreground else fallback,
+            .@"cell-background" => if (cell) |v| v.background else fallback,
+        };
+    }
+
     /// Used by Formatter
     pub fn formatEntry(self: TerminalColor, formatter: formatterpkg.EntryFormatter) !void {
         switch (self) {
