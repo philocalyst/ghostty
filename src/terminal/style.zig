@@ -55,6 +55,19 @@ pub const Style = struct {
             rgb,
         };
 
+        /// The concrete color this names, or null for `.none`. A
+        /// palette entry is resolved through `palette`.
+        pub fn toRGB(
+            self: Color,
+            palette: *const color.Palette,
+        ) ?color.RGB {
+            return switch (self) {
+                .none => null,
+                .palette => |idx| palette[idx],
+                .rgb => |rgb| rgb,
+            };
+        }
+
         /// True if the color is equal to another color.
         pub fn eql(self: Color, other: Color) bool {
             return @as(Tag, self) == @as(Tag, other) and switch (self) {
@@ -219,11 +232,7 @@ pub const Style = struct {
         self: Style,
         palette: *const color.Palette,
     ) ?color.RGB {
-        return switch (self.underline_color) {
-            .none => null,
-            .palette => |idx| palette[idx],
-            .rgb => |rgb| rgb,
-        };
+        return self.underline_color.toRGB(palette);
     }
 
     /// Returns a bg-color only cell from this style, if it exists.
