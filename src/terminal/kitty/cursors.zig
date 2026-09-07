@@ -906,3 +906,244 @@ test "Color: decode and encode" {
     try testing.expect(Color.decode(5, &.{}) == null);
     try testing.expect(Color.decode(9, &.{}) == null);
 }
+
+/// Assert the whole grid, one character per cell with rows separated by
+/// '/', along with the count that must always agree with it.
+fn expectGrid(state: *const State, expected: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var live: usize = 0;
+    for (0..state.rows) |y| {
+        if (y > 0) try w.writeByte('/');
+        for (0..state.cols) |x| {
+            const shape: Shape = if (state.shapes.items.len == 0)
+                .none
+            else
+                state.shapes.items[y * state.cols + x];
+            if (shape != .none) live += 1;
+            try w.writeByte(switch (shape) {
+                .none => '.',
+                .block => 'b',
+                .beam => '|',
+                .underline => '_',
+                .follow => 'f',
+            });
+        }
+    }
+
+    try testing.expectEqualStrings(expected, w.buffered());
+
+    // `count` is maintained incrementally. Check it against the grid it
+    // claims to summarize.
+    try testing.expectEqual(live, state.count);
+}
+
+test "State: paint and erase" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 5, .rows = 4 };
+    defer s.deinit(alloc);
+
+    // Erasing an empty screen does nothing. It must not tick the
+    // generation, or every frame would look dirty.
+    try s.apply(alloc, testUpdate(.{ .paint = .none }, &.{ 0, 4 }, &.{}), .{});
+    try testing.expectEqual(0, s.count);
+    try testing.expectEqual(0, s.generation);
+
+    // Two points, one on the main cursor and one in the far corner.
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 2, 1, 1, 4, 5, 0, 1, 5, 1, 1, 6 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
+    ), .{});
+    try expectGrid(&s, "b..../...../...../....b");
+
+    // A rectangle that overlaps neither, plus one entirely off screen.
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .beam },
+        &.{ 2, 4, 2, 2, 3, 4, 9, 9, 9, 9 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+    ), .{});
+    try expectGrid(&s, "b..../.|||./.|||./....b");
+
+    // Erasing a rectangle removes only the cells inside it.
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .none },
+        &.{ 0, 4, 1, 1, 2, 4 },
+        &.{ 1, 2, 3, 4 },
+    ), .{});
+    try expectGrid(&s, "...../...../.|||./....b");
+
+    // A bare coordinate type 4 is the whole screen. It replaces the run
+    // on each row; it does not append a second one.
+    try s.apply(alloc, testUpdate(.{ .paint = .beam }, &.{ 2, 4 }, &.{}), .{});
+    try expectGrid(&s, "|||||/|||||/|||||/|||||");
+
+    // Repainting an identical run changes nothing.
+    const generation = s.generation;
+    try s.apply(alloc, testUpdate(.{ .paint = .beam }, &.{ 2, 4 }, &.{}), .{});
+    try testing.expectEqual(generation, s.generation);
+
+    // Erasing the whole screen drops everything.
+    try s.apply(alloc, testUpdate(.{ .paint = .none }, &.{ 0, 4 }, &.{}), .{});
+    try expectGrid(&s, "...../...../...../.....");
+}
+
+test "State: coordinates are clipped and validated" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 4, .rows = 3 };
+    defer s.deinit(alloc);
+
+    // Three rectangles in three groups. One has a zero coordinate,
+    // which a one-based system has no room for. One is inverted, and so
+    // empty. One is entirely past the grid. None may paint a cell.
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 4, 0, 1, 1, 1, 4, 3, 3, 2, 2, 4, 9, 9, 9, 9 },
+        &.{ 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14 },
+    ), .{});
+    try expectGrid(&s, "..../..../....");
+    try testing.expectEqual(0, s.generation);
+
+    // A rectangle straddling the edge keeps the part that is on screen.
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 4, 2, 3, 9, 9 },
+        &.{ 1, 2, 3, 4 },
+    ), .{});
+    try expectGrid(&s, "..../..bb/..bb");
+
+    // The main cursor's cell, clamped if it somehow sits off the grid.
+    try s.apply(
+        alloc,
+        testUpdate(.{ .paint = .underline }, &.{ 3, 0 }, &.{}),
+        .{ .x = 99, .y = 99 },
+    );
+    try expectGrid(&s, "..../..bb/..b_");
+}
+
+test "State: resize and reset" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 4, .rows = 3 };
+    defer s.deinit(alloc);
+
+    try s.apply(alloc, testUpdate(.{ .paint = .block }, &.{ 1, 4 }, &.{}), .{});
+    s.text_color = .rgb(1, 2, 3);
+    s.cursor_color = .special;
+
+    // A resize to the same dimensions must not disturb anything.
+    const generation = s.generation;
+    s.resize(4, 3);
+    try testing.expectEqual(generation, s.generation);
+    try testing.expectEqual(12, s.count);
+
+    // A real resize drops the positions but keeps the colors.
+    s.resize(2, 2);
+    try expectGrid(&s, "../..");
+    try testing.expect(s.text_color.eql(.rgb(1, 2, 3)));
+    try testing.expect(s.cursor_color.eql(.special));
+
+    // A full reset restores the colors too.
+    const before_reset = s.generation;
+    s.reset();
+    try testing.expectEqual(before_reset +% 1, s.generation);
+    try testing.expect(s.text_color.eql(.unset));
+    try testing.expect(s.cursor_color.eql(.unset));
+}
+
+test "State: allocation failure is atomic" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 4, .rows = 4 };
+    defer s.deinit(alloc);
+
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, s.apply(
+        failing.allocator(),
+        testUpdate(.{ .paint = .block }, &.{ 1, 4 }, &.{}),
+        .{},
+    ));
+
+    // Nothing was applied, so nothing may have been observed either.
+    try expectGrid(&s, "..../..../..../....");
+    try testing.expectEqual(0, s.generation);
+
+    // Erasing never allocates. It works under a failing allocator, and
+    // before the grid exists at all.
+    try s.apply(
+        failing.allocator(),
+        testUpdate(.{ .paint = .none }, &.{ 0, 4 }, &.{}),
+        .{},
+    );
+    try testing.expectEqual(0, s.generation);
+}
+
+test "State: colors" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 2, .rows = 1 };
+    defer s.deinit(alloc);
+
+    // Several groups in one sequence. The last valid one wins, and an
+    // unknown color space is skipped without clobbering what came
+    // before it.
+    try s.apply(alloc, testUpdate(
+        .{ .text_color = {} },
+        &.{ 30, 5, 3, 2, 1, 2, 3, 9, 9 },
+        &.{ 1, 3, 4, 5, 7 },
+    ), .{});
+    try testing.expect(s.text_color.eql(.rgb(1, 2, 3)));
+
+    // Reapplying the same color is not a change.
+    const generation = s.generation;
+    try s.apply(alloc, testUpdate(
+        .{ .text_color = {} },
+        &.{ 30, 2, 1, 2, 3 },
+        &.{ 1, 2, 3 },
+    ), .{});
+    try testing.expectEqual(generation, s.generation);
+
+    // The two colors are independent slots.
+    try s.apply(alloc, testUpdate(
+        .{ .cursor_color = {} },
+        &.{ 40, 1 },
+        &.{1},
+    ), .{});
+    try testing.expect(s.cursor_color.eql(.special));
+    try testing.expect(s.text_color.eql(.rgb(1, 2, 3)));
+}
+
+test "State: query responses are byte exact" {
+    const alloc = testing.allocator;
+    var s: State = .{ .cols = 4, .rows = 3 };
+    defer s.deinit(alloc);
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .block },
+        &.{ 1, 2, 1, 1 },
+        &.{ 1, 2 },
+    ), .{});
+    try s.apply(alloc, testUpdate(
+        .{ .paint = .follow },
+        &.{ 29, 2, 2, 3 },
+        &.{ 1, 2 },
+    ), .{});
+    s.text_color = .rgb(1, 2, 3);
+    s.cursor_color = .{ .value = .{ .palette = 7 } };
+
+    const cases = .{
+        .{ Query.support, "\x1b[>1;2;3;29;30;40;100;101 q" },
+        .{ Query.cursors, "\x1b[>100;1:2:1:1;29:2:2:3 q" },
+        .{ Query.colors, "\x1b[>101;30:2:1:2:3;40:5:7 q" },
+    };
+    inline for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try s.writeResponse(case[0], &w);
+        try testing.expectEqualStrings(case[1], w.buffered());
+    }
+
+    // With no cursors the position response is empty but still well
+    // formed, as the spec requires.
+    s.clear();
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.writeResponse(.cursors, &w);
+    try testing.expectEqualStrings("\x1b[>100 q", w.buffered());
+}
