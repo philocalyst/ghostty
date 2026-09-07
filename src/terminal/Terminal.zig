@@ -3771,6 +3771,18 @@ pub fn eraseDisplay(
 
         .scrollback => self.screens.active.eraseHistory(null),
     }
+
+    // The kitty multiple cursors protocol names ED 2, 3, and 22 as
+    // removing every extra cursor. ED 3 is on that list even though it
+    // erases only scrollback, which extra cursors never occupy.
+    switch (mode) {
+        .scroll_complete,
+        .complete,
+        .scrollback,
+        => self.kitty_extra_cursors.clear(),
+
+        .below, .above => {},
+    }
 }
 
 /// Resets all margins and fills the whole screen with the character 'E'
@@ -4249,6 +4261,7 @@ pub fn resize(
     // Set our size
     self.cols = opts.cols;
     self.rows = opts.rows;
+    self.kitty_extra_cursors.resize(opts.cols, opts.rows);
 
     // Reset the scrolling region
     self.scrolling_region = .{
@@ -4859,6 +4872,11 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
     // Finalize the switch
     self.screens.switchTo(key);
 
+    // Extra cursor positions belong to the screen buffer, so they are
+    // cleared here at the primitive switch and not at each of its
+    // callers. The shared colors are terminal-wide and stay.
+    self.kitty_extra_cursors.clear();
+
     return old;
 }
 
@@ -4990,6 +5008,7 @@ pub fn fullReset(self: *Terminal) void {
 
     // Reset primary screen
     self.screens.active.reset();
+    self.kitty_extra_cursors.reset();
 
     // Reset our basic state
     self.flags = .{
