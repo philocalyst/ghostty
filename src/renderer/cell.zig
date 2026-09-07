@@ -73,6 +73,17 @@ pub const Contents = struct {
     /// calling any operations.
     fg_rows: []CellTextRow = &.{},
 
+    /// The main cursor's glyph this frame, if it has one.
+    ///
+    /// `addCursor` records it, so it cannot disagree with what was
+    /// drawn. Extra cursors never land here; custom shaders get the real
+    /// cursor and nothing else.
+    main_cursor: ?shaderpkg.CellText = null,
+
+    /// Which cursor a glyph belongs to. At most one glyph per frame is
+    /// `.main`. The kitty multiple cursors protocol produces the rest.
+    pub const CursorRole = enum { main, extra };
+
     pub fn deinit(self: *Contents, alloc: Allocator) void {
         alloc.free(self.bg_cells);
         for (self.fg_rows) |*row| row.deinit(alloc);
@@ -104,7 +115,10 @@ pub const Contents = struct {
         // can produce arbitrarily many glyphs in one column.
         const fg_row_capacity = @as(usize, size.columns) * 3;
 
-        // The cursor lists need just one cell. The rest get the full capacity.
+        // Both cursor lists start with room for one glyph. That covers
+        // the ordinary single-cursor frame without allocating; the
+        // kitty protocol's extras grow the list as they arrive. Every
+        // other row gets the full capacity up front.
         fg_rows[0] = try .initCapacity(alloc, 1);
         fg_rows[row_count + 1] = try .initCapacity(alloc, 1);
         for (fg_rows[1 .. row_count + 1]) |*row| {
@@ -130,39 +144,47 @@ pub const Contents = struct {
     pub fn reset(self: *Contents) void {
         @memset(self.bg_cells, .{ 0, 0, 0, 0 });
         for (self.fg_rows) |*row| row.clearRetainingCapacity();
+        self.main_cursor = null;
     }
 
-    /// Set the cursor value. If the value is null then the cursor is hidden.
-    pub fn setCursor(
-        self: *Contents,
-        v: ?shaderpkg.CellText,
-        cursor_style: ?renderer.CursorStyle,
-    ) void {
+    /// Remove every cursor glyph, and any text recoloring they caused.
+    /// Call this once per frame before adding this frame's cursors.
+    pub fn clearCursor(self: *Contents) void {
+        self.main_cursor = null;
         if (self.size.rows == 0) return;
         self.fg_rows[0].clearRetainingCapacity();
         self.fg_rows[self.size.rows + 1].clearRetainingCapacity();
-
-        const cell = v orelse return;
-        const style = cursor_style orelse return;
-
-        switch (style) {
-            // Block cursors should be drawn first
-            .block => self.fg_rows[0].appendAssumeCapacity(cell),
-            // Other cursor styles should be drawn last
-            .block_hollow, .bar, .underline, .lock => self.fg_rows[self.size.rows + 1].appendAssumeCapacity(cell),
-        }
     }
 
-    /// Returns the current cursor glyph if present, checking both cursor lists.
-    pub fn getCursorGlyph(self: *Contents) ?shaderpkg.CellText {
-        if (self.size.rows == 0) return null;
-        if (self.fg_rows[0].items.len > 0) {
-            return self.fg_rows[0].items[0];
-        }
-        if (self.fg_rows[self.size.rows + 1].items.len > 0) {
-            return self.fg_rows[self.size.rows + 1].items[0];
-        }
-        return null;
+    /// Add a cursor glyph to the frame.
+    ///
+    /// Block cursors go in the list drawn before the row contents, under
+    /// the text. Every other style goes in the list drawn after it, over
+    /// the text. Any number may be added between clears; the kitty
+    /// multiple cursors protocol needs that.
+    pub fn addCursor(
+        self: *Contents,
+        alloc: Allocator,
+        v: shaderpkg.CellText,
+        cursor_style: renderer.CursorStyle,
+        role: CursorRole,
+    ) Allocator.Error!void {
+        if (self.size.rows == 0) return;
+
+        const list = switch (cursor_style) {
+            .block => &self.fg_rows[0],
+            .block_hollow,
+            .bar,
+            .underline,
+            .lock,
+            => &self.fg_rows[self.size.rows + 1],
+        };
+        try list.append(alloc, v);
+
+        // Recorded only after the append succeeds. `main_cursor` and the
+        // draw lists then always agree about whether a main cursor was
+        // drawn.
+        if (role == .main) self.main_cursor = v;
     }
 
     /// Access a background cell. Prefer this function over direct indexing
@@ -397,19 +419,19 @@ test Contents {
         .grid_pos = .{ 2, 3 },
         .color = .{ 0, 0, 0, 1 },
     };
-    c.setCursor(cursor_cell, .block);
+    try c.addCursor(alloc, cursor_cell, .block, .main);
     try testing.expectEqual(cursor_cell, c.fg_rows[0].items[0]);
-    try testing.expectEqual(cursor_cell, c.getCursorGlyph().?);
+    try testing.expectEqual(cursor_cell, c.main_cursor.?);
 
     // And remove it.
-    c.setCursor(null, null);
+    c.clearCursor();
     try testing.expectEqual(0, c.fg_rows[0].items.len);
-    try testing.expect(c.getCursorGlyph() == null);
+    try testing.expect(c.main_cursor == null);
 
     // Add a hollow cursor.
-    c.setCursor(cursor_cell, .block_hollow);
+    try c.addCursor(alloc, cursor_cell, .block_hollow, .main);
     try testing.expectEqual(cursor_cell, c.fg_rows[rows + 1].items[0]);
-    try testing.expectEqual(cursor_cell, c.getCursorGlyph().?);
+    try testing.expectEqual(cursor_cell, c.main_cursor.?);
 }
 
 test "Contents resize grows and shrinks" {
@@ -427,12 +449,12 @@ test "Contents resize grows and shrinks" {
     };
     try c.add(alloc, .text, cell);
     c.bgCell(1, 1).* = .{ 0, 0, 0, 1 };
-    c.setCursor(cell, .bar);
+    try c.addCursor(alloc, cell, .bar, .main);
 
     try c.resize(alloc, .{ .rows = 3, .columns = 4 });
     try testing.expectEqual(.{ 0, 0, 0, 0 }, c.bgCell(1, 1).*);
     try testing.expectEqual(@as(usize, 0), c.fg_rows[2].items.len);
-    try testing.expectEqual(@as(?shaderpkg.CellText, null), c.getCursorGlyph());
+    try testing.expectEqual(@as(?shaderpkg.CellText, null), c.main_cursor);
     cell.grid_pos = .{ 3, 2 };
     try c.add(alloc, .text, cell);
 
@@ -528,8 +550,8 @@ test "Contents with zero-sized screen" {
     var c: Contents = .{};
     defer c.deinit(alloc);
 
-    c.setCursor(null, null);
-    try testing.expect(c.getCursorGlyph() == null);
+    c.clearCursor();
+    try testing.expect(c.main_cursor == null);
 }
 
 test "Cell constraint widths" {
