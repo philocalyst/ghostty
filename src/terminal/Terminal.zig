@@ -102,6 +102,13 @@ glyph_glossary: glyph.Glossary = .empty,
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
 
+/// Kitty multiple cursors protocol state.
+///
+/// Buffer switches, resizes, and destructive erases clear the cursor
+/// positions. The two shared colors are terminal-wide and survive all
+/// of those. kitty does the same.
+kitty_extra_cursors: kitty.cursors.State,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -367,14 +374,33 @@ pub fn init(
             .default_blink = opts.default_cursor_blink,
         },
         .default_xt_checksum = opts.default_xt_checksum,
+        .kitty_extra_cursors = .{ .cols = cols, .rows = rows },
     };
     result.flags.xt_checksum = opts.default_xt_checksum;
     result.setCursorStyle(.default);
     return result;
 }
 
+/// Apply a state-changing kitty multiple cursors command.
+///
+/// Coordinate type 0 targets the cell the main cursor is on. The
+/// position is supplied here so that no stream handler routing one of
+/// these has to dig it out itself.
+pub fn kittyMultipleCursors(
+    self: *Terminal,
+    update: kitty.cursors.Update,
+) Allocator.Error!void {
+    const cursor = &self.screens.active.cursor;
+    try self.kitty_extra_cursors.apply(
+        self.gpa(),
+        update,
+        .{ .x = cursor.x, .y = cursor.y },
+    );
+}
+
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.tabstops.deinit(alloc);
+    self.kitty_extra_cursors.deinit(alloc);
     self.screens.deinit(alloc);
     self.colors.palette.deinit(alloc);
     self.pwd.deinit(alloc);
