@@ -51,6 +51,21 @@ pub const default: Palette = default: {
 /// Palette is the 256 color palette.
 pub const Palette = [256]RGB;
 
+/// A foreground and background color as they are actually drawn.
+///
+/// Any inversion the source applied is already baked in. `foreground` is
+/// the color the glyphs take and `background` the color behind them,
+/// whichever style bits produced them.
+///
+/// This lives here, not beside the render state that computes it, so the
+/// configuration layer can name it. That layer imports only a few leaf
+/// types from the terminal, and it needs this one to say what
+/// `cell-foreground` and `cell-background` resolve to.
+pub const Pair = struct {
+    foreground: RGB,
+    background: RGB,
+};
+
 /// A parsed palette entry from Ghostty's config "N=COLOR" syntax.
 pub const PaletteEntry = struct {
     index: u8,
