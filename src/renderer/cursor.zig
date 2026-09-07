@@ -342,6 +342,310 @@ pub const Cursors = struct {
     }
 };
 
+/// Scaffolding shared by the extra cursor tests below.
+const Test = struct {
+    /// The colors written into the cell at (0, 0) by `state`.
+    const cell_fg: terminal.color.RGB = .{ .r = 240, .g = 240, .b = 240 };
+    const cell_bg: terminal.color.RGB = .{ .r = 10, .g = 10, .b = 10 };
+
+    /// Stand-ins for the main cursor's colors, which extra cursors
+    /// inherit unless the protocol overrides them.
+    const colors: Cursor.Colors = .{
+        .cursor = .{ .r = 6, .g = 5, .b = 4 },
+        .text = .{ .r = 3, .g = 2, .b = 1 },
+    };
+
+    /// A focused, unblinked frame with no main cursor drawn.
+    const opts: Cursors.Options = .{
+        .colors = colors,
+        .style = null,
+        .visibility = .{ .focused = true, .blink_visible = true },
+    };
+
+    /// The same, with the main cursor drawn in `style`.
+    fn withMain(style_: Style) Cursors.Options {
+        var result = opts;
+        result.style = style_;
+        return result;
+    }
+
+    /// Write one cell at the home position under `sgr` and snapshot it.
+    fn state(
+        alloc: std.mem.Allocator,
+        term: *terminal.Terminal,
+        out: *terminal.RenderState,
+        sgr: []const u8,
+    ) !void {
+        var stream = term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[H");
+        stream.nextSlice(sgr);
+        stream.nextSlice("X\x1b[m");
+        try out.update(alloc, term);
+    }
+
+    /// Every extra cursor the iterator yields, in order.
+    fn collect(cursors: *Cursors, buf: []Cursor) []Cursor {
+        var len: usize = 0;
+        while (cursors.next()) |c| : (len += 1) buf[len] = c;
+        return buf[0..len];
+    }
+};
+
+test "cursor: extra cursor shapes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    state.cursor.visual_style = .bar;
+    try state.extra_cursors.list.appendSlice(alloc, &.{
+        .{ .x = 0, .y = 0, .shape = .block },
+        .{ .x = 0, .y = 0, .shape = .beam },
+        .{ .x = 0, .y = 0, .shape = .underline },
+        .{ .x = 0, .y = 0, .shape = .follow },
+        // An erase never survives into the snapshot. Skip a stale one;
+        // don't draw it.
+        .{ .x = 1, .y = 0, .shape = .none },
+        // Off the grid, which a stale snapshot can contain.
+        .{ .x = 2, .y = 0, .shape = .block },
+    });
+
+    var buf: [8]Cursor = undefined;
+
+    // With the main cursor hidden, `follow` falls back to the shape the
+    // terminal asked for, and every extra inherits the main colors.
+    var cursors: Cursors = .init(&state, Test.opts);
+    try testing.expect(cursors.main == null);
+    for (Test.collect(&cursors, &buf), [_]Style{
+        .block,
+        .bar,
+        .underline,
+        .bar,
+    }) |c, expected| {
+        try testing.expectEqual(expected, c.style);
+        try testing.expectEqual(Test.colors, c.colors);
+        try testing.expect(!c.wide);
+    }
+
+    // With it drawn, `follow` takes its style instead.
+    state.cursor.viewport = .{ .x = 1, .y = 0, .wide_tail = false };
+    cursors = .init(&state, Test.withMain(.underline));
+    try testing.expectEqual(Style.underline, cursors.main.?.style);
+    for (Test.collect(&cursors, &buf), [_]Style{
+        .block,
+        .bar,
+        .underline,
+        .underline,
+    }) |c, expected| try testing.expectEqual(expected, c.style);
+}
+
+test "cursor: extra cursor colors" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try Test.state(
+        alloc,
+        &term,
+        &state,
+        "\x1b[38;2;240;240;240;48;2;10;10;10m",
+    );
+
+    try state.extra_cursors.list.append(alloc, .{
+        .x = 0,
+        .y = 0,
+        .shape = .block,
+    });
+
+    const cases = .{
+        // An explicit cursor color with a special text color is partial
+        // reverse video: only the text takes the cell's background.
+        .{
+            terminal.kitty.cursors.Color.rgb(9, 8, 7),
+            terminal.kitty.cursors.Color.special,
+            Cursor.Colors{
+                .cursor = .{ .r = 9, .g = 8, .b = 7 },
+                .text = Test.cell_bg,
+            },
+        },
+
+        // A special cursor color is full reverse video, and overrides
+        // the text color entirely.
+        .{
+            terminal.kitty.cursors.Color.special,
+            terminal.kitty.cursors.Color.rgb(255, 0, 0),
+            Cursor.Colors{ .cursor = Test.cell_fg, .text = Test.cell_bg },
+        },
+
+        // Unset colors inherit the main cursor's.
+        .{
+            terminal.kitty.cursors.Color.unset,
+            terminal.kitty.cursors.Color.unset,
+            Test.colors,
+        },
+    };
+
+    inline for (cases) |case| {
+        state.extra_cursors.cursor_color = case[0];
+        state.extra_cursors.text_color = case[1];
+        var cursors: Cursors = .init(&state, Test.opts);
+        try testing.expectEqual(case[2], cursors.next().?.colors);
+    }
+
+    // A palette index resolves through the render state's palette.
+    state.extra_cursors.cursor_color = .{ .value = .{ .palette = 3 } };
+    state.extra_cursors.text_color = .unset;
+    var cursors: Cursors = .init(&state, Test.opts);
+    try testing.expectEqual(Cursor.Colors{
+        .cursor = state.colors.palette[3],
+        .text = Test.colors.text,
+    }, cursors.next().?.colors);
+}
+
+test "cursor: reverse video uses the colors as drawn" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // The same colors as above with SGR inverse set. What is painted is
+    // already swapped, and reversing has to follow suit.
+    try Test.state(
+        alloc,
+        &term,
+        &state,
+        "\x1b[7;38;2;240;240;240;48;2;10;10;10m",
+    );
+
+    state.extra_cursors.cursor_color = .special;
+    try state.extra_cursors.list.append(alloc, .{
+        .x = 0,
+        .y = 0,
+        .shape = .block,
+    });
+
+    var cursors: Cursors = .init(&state, Test.opts);
+    try testing.expectEqual(Cursor.Colors{
+        .cursor = Test.cell_bg,
+        .text = Test.cell_fg,
+    }, cursors.next().?.colors);
+}
+
+test "cursor: reverse video falls back on unreadable cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // A cell whose own colors are nearly identical. Reversing them would
+    // leave the cursor invisible.
+    try Test.state(
+        alloc,
+        &term,
+        &state,
+        "\x1b[38;2;100;100;100;48;2;101;101;101m",
+    );
+
+    state.extra_cursors.cursor_color = .special;
+    try state.extra_cursors.list.append(alloc, .{
+        .x = 0,
+        .y = 0,
+        .shape = .block,
+    });
+
+    var cursors: Cursors = .init(&state, Test.opts);
+    try testing.expectEqual(Cursor.Colors{
+        .cursor = state.colors.foreground,
+        .text = state.colors.background,
+    }, cursors.next().?.colors);
+}
+
+test "cursor: main cursor covers the extras beneath it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    try state.extra_cursors.list.appendSlice(alloc, &.{
+        .{ .x = 0, .y = 0, .shape = .block },
+        .{ .x = 1, .y = 0, .shape = .block },
+        // Neither of these is under the main cursor.
+        .{ .x = 2, .y = 0, .shape = .block },
+        .{ .x = 0, .y = 1, .shape = .block },
+    });
+
+    const opts = Test.withMain(.block);
+    var buf: [8]Cursor = undefined;
+
+    // A main cursor on a wide character covers both of its cells, and
+    // on the spacer tail it draws one cell back but covers the same two.
+    for ([_]terminal.RenderState.Cursor.Viewport{
+        .{ .x = 0, .y = 0, .wide_tail = false },
+        .{ .x = 1, .y = 0, .wide_tail = true },
+    }, [_]terminal.page.Cell.Wide{ .wide, .spacer_tail }) |viewport, wide| {
+        state.cursor.viewport = viewport;
+        state.cursor.cell.wide = wide;
+
+        var cursors: Cursors = .init(&state, opts);
+        try testing.expectEqual(0, cursors.main.?.x);
+        try testing.expect(cursors.main.?.wide);
+
+        const rest = Test.collect(&cursors, &buf);
+        try testing.expectEqual(2, rest.len);
+        try testing.expectEqual(2, rest[0].x);
+        try testing.expectEqual(1, rest[1].y);
+    }
+
+    // With no main cursor drawn, nothing is covered.
+    var cursors: Cursors = .init(&state, Test.opts);
+    try testing.expectEqual(4, Test.collect(&cursors, &buf).len);
+}
+
+test "cursor: extras share the blink phase but not focus loss" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    state.cursor.blinking = true;
+    try state.extra_cursors.list.append(alloc, .{
+        .x = 1,
+        .y = 0,
+        .shape = .block,
+    });
+
+    // Blinked off while focused, the extras go with the main cursor.
+    // Unfocused, the blink timer is stopped and the phase is stale, so
+    // it must hide nothing.
+    for ([_]bool{ true, false }, [_]bool{ false, true }) |focused, visible| {
+        var cursors: Cursors = .init(&state, .{
+            .colors = Test.colors,
+            .style = null,
+            .visibility = .{
+                .focused = focused,
+                .blink_visible = false,
+            },
+        });
+        try testing.expectEqual(visible, cursors.next() != null);
+    }
+}
+
 test "cursor: default uses configured style" {
     const testing = std.testing;
     const alloc = testing.allocator;
