@@ -73,6 +73,10 @@ pub const Contents = struct {
     /// calling any operations.
     fg_rows: []CellTextRow = &.{},
 
+    /// Saved colors for text under extra block cursors, swapped in only
+    /// for the duration of the GPU upload. See `swapCursorText`.
+    cursor_text: std.ArrayListUnmanaged(CursorText) = .empty,
+
     /// The main cursor's glyph this frame, if it has one.
     ///
     /// `addCursor` records it, so it cannot disagree with what was
@@ -88,6 +92,7 @@ pub const Contents = struct {
         alloc.free(self.bg_cells);
         for (self.fg_rows) |*row| row.deinit(alloc);
         alloc.free(self.fg_rows);
+        self.cursor_text.deinit(alloc);
     }
 
     /// Resize the cell contents for the given grid size. This will
@@ -144,12 +149,14 @@ pub const Contents = struct {
     pub fn reset(self: *Contents) void {
         @memset(self.bg_cells, .{ 0, 0, 0, 0 });
         for (self.fg_rows) |*row| row.clearRetainingCapacity();
+        self.cursor_text.clearRetainingCapacity();
         self.main_cursor = null;
     }
 
     /// Remove every cursor glyph, and any text recoloring they caused.
     /// Call this once per frame before adding this frame's cursors.
     pub fn clearCursor(self: *Contents) void {
+        self.cursor_text.clearRetainingCapacity();
         self.main_cursor = null;
         if (self.size.rows == 0) return;
         self.fg_rows[0].clearRetainingCapacity();
@@ -185,6 +192,77 @@ pub const Contents = struct {
         // draw lists then always agree about whether a main cursor was
         // drawn.
         if (role == .main) self.main_cursor = v;
+    }
+
+    /// Recolor the text in a cell covered by an extra block cursor.
+    ///
+    /// A clean row keeps its cache across frames, so the new colors must
+    /// not be written into it. This records the vertices instead, and
+    /// `swapCursorText` swaps them in around the GPU upload and back out
+    /// after it.
+    pub fn addCursorText(
+        self: *Contents,
+        alloc: Allocator,
+        x: terminal.size.CellCountInt,
+        y: terminal.size.CellCountInt,
+        color: terminal.color.RGB,
+    ) Allocator.Error!void {
+        if (y >= self.size.rows or x >= self.size.columns) return;
+
+        // A cell can hold more than one glyph, and rows are built in
+        // column order, so every vertex for a column is one contiguous
+        // run. Binary search for it: a dense rectangle of block cursors
+        // would otherwise rescan the whole row once per cursor.
+        //
+        // Preedit glyphs are appended after a row is built and leave it
+        // out of column order, so the caller must not ask for a row
+        // carrying them. `swapCursorText` asserts what it can of this.
+        const row: u32 = @as(u32, y) + 1;
+        const first, const last = std.sort.equalRange(
+            shaderpkg.CellText,
+            self.fg_rows[row].items,
+            x,
+            compareColumn,
+        );
+
+        try self.cursor_text.ensureUnusedCapacity(alloc, last - first);
+        for (first..last) |index| self.cursor_text.appendAssumeCapacity(.{
+            .row = row,
+            .index = @intCast(index),
+            .column = x,
+            .color = .{ color.r, color.g, color.b, 255 },
+        });
+    }
+
+    /// Order a foreground vertex against a grid column, for the binary
+    /// search in `addCursorText`.
+    fn compareColumn(
+        x: terminal.size.CellCountInt,
+        cell: shaderpkg.CellText,
+    ) std.math.Order {
+        return std.math.order(x, cell.grid_pos[0]);
+    }
+
+    /// Swap the extra cursor text colors with the ones in the row caches.
+    /// This is self-inverse: call it immediately before the GPU upload
+    /// and again immediately after to restore the caches.
+    ///
+    /// The saved indexes hold only while the rows they point into are
+    /// the ones `addCursorText` searched. Three things rebuild a row:
+    /// `reset`, `resize`, and the per-row clear in `clear`. All three
+    /// run before a frame's cursors are added, so the indexes survive.
+    /// The column check below stands guard over that, and over the
+    /// column ordering `equalRange` needs.
+    pub fn swapCursorText(self: *Contents) void {
+        for (self.cursor_text.items) |*saved| {
+            const vertex = &self.fg_rows[saved.row].items[saved.index];
+            assert(vertex.grid_pos[0] == saved.column);
+            std.mem.swap(
+                @TypeOf(saved.color),
+                &saved.color,
+                &vertex.color,
+            );
+        }
     }
 
     /// Access a background cell. Prefer this function over direct indexing
@@ -235,6 +313,20 @@ pub const Contents = struct {
         // the correct index.
         self.fg_rows[y + 1].clearRetainingCapacity();
     }
+};
+
+/// A temporary color override for one cached foreground vertex,
+/// identified by its row list and its position within that list.
+const CursorText = struct {
+    row: u32,
+    index: u32,
+
+    /// The column the vertex sat at when it was recorded. A row rebuilt
+    /// between recording and swapping leaves `index` pointing at some
+    /// other glyph; this catches that.
+    column: terminal.size.CellCountInt,
+
+    color: @FieldType(shaderpkg.CellText, "color"),
 };
 
 /// Returns true if a codepoint for a cell is a covering character. A covering
@@ -432,6 +524,65 @@ test Contents {
     try c.addCursor(alloc, cursor_cell, .block_hollow, .main);
     try testing.expectEqual(cursor_cell, c.fg_rows[rows + 1].items[0]);
     try testing.expectEqual(cursor_cell, c.main_cursor.?);
+}
+
+test "Contents cursor overlays preserve cached rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var c: Contents = .{};
+    try c.resize(alloc, .{ .rows = 2, .columns = 4 });
+    defer c.deinit(alloc);
+
+    // Two glyphs in column 1 (a composite) and one in column 2.
+    const cells = [_]shaderpkg.CellText{
+        .{ .atlas = .grayscale, .grid_pos = .{ 1, 0 }, .color = .{ 1, 2, 3, 4 } },
+        .{ .atlas = .grayscale, .grid_pos = .{ 1, 0 }, .color = .{ 5, 6, 7, 8 } },
+        .{ .atlas = .grayscale, .grid_pos = .{ 2, 0 }, .color = .{ 9, 10, 11, 12 } },
+    };
+    for (cells) |cell| try c.add(alloc, .text, cell);
+
+    try c.addCursor(alloc, .{
+        .atlas = .grayscale,
+        .bools = .{ .is_cursor_glyph = true },
+        .grid_pos = .{ 1, 0 },
+        .color = .{ 0, 0, 0, 0 },
+    }, .block, .extra);
+
+    // Out of order, and one column with no glyphs at all.
+    try c.addCursorText(alloc, 2, 0, .{ .r = 50, .g = 60, .b = 70 });
+    try c.addCursorText(alloc, 1, 0, .{ .r = 20, .g = 30, .b = 40 });
+    try c.addCursorText(alloc, 3, 0, .{ .r = 80, .g = 90, .b = 100 });
+    try testing.expectEqual(@as(usize, 3), c.cursor_text.items.len);
+
+    // The row is untouched until the swap, overridden exactly once
+    // during it, and restored byte for byte after.
+    try testing.expectEqualSlices(shaderpkg.CellText, &cells, c.fg_rows[1].items);
+    c.swapCursorText();
+    try testing.expectEqual([4]u8{ 20, 30, 40, 255 }, c.fg_rows[1].items[0].color);
+    try testing.expectEqual([4]u8{ 20, 30, 40, 255 }, c.fg_rows[1].items[1].color);
+    try testing.expectEqual([4]u8{ 50, 60, 70, 255 }, c.fg_rows[1].items[2].color);
+    c.swapCursorText();
+    try testing.expectEqualSlices(shaderpkg.CellText, &cells, c.fg_rows[1].items);
+
+    // The main cursor is reported to custom shaders even when extra
+    // cursors are in the same list, or in the other one.
+    try testing.expectEqual(@as(?shaderpkg.CellText, null), c.main_cursor);
+    const main: shaderpkg.CellText = .{
+        .atlas = .grayscale,
+        .bools = .{ .is_cursor_glyph = true },
+        .grid_pos = .{ 3, 0 },
+        .color = .{ 1, 1, 1, 1 },
+    };
+    try c.addCursor(alloc, main, .bar, .main);
+    try testing.expectEqual(main, c.main_cursor.?);
+
+    // Clearing the cursors drops the overrides but not the row.
+    c.clearCursor();
+    try testing.expect(c.main_cursor == null);
+    try testing.expectEqual(@as(usize, 0), c.fg_rows[0].items.len);
+    try testing.expectEqual(@as(usize, 0), c.fg_rows[c.size.rows + 1].items.len);
+    try testing.expectEqual(@as(usize, 0), c.cursor_text.items.len);
+    try testing.expectEqualSlices(shaderpkg.CellText, &cells, c.fg_rows[1].items);
 }
 
 test "Contents resize grows and shrinks" {
