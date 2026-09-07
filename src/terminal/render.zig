@@ -2793,6 +2793,87 @@ test "flattened highlights require matching page serial" {
     }
 }
 
+test "extra cursors snapshot by generation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 6, .rows = 4 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[>1;2:1:1;2:4:6 q\x1b[>30;2:1:2:3 q");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqualSlices(kitty_cursors.Cursor, &.{
+        .{ .x = 0, .y = 0, .shape = .block },
+        .{ .x = 5, .y = 3, .shape = .block },
+    }, state.extra_cursors.list.items);
+    try testing.expect(state.extra_cursors.text_color.eql(.rgb(1, 2, 3)));
+    try testing.expectEqual(
+        t.kitty_extra_cursors.generation,
+        state.extra_cursors.generation,
+    );
+
+    // Reapplying identical state changes nothing. The snapshot is left
+    // alone and the frame stays clean.
+    state.clean();
+    const generation = state.extra_cursors.generation;
+    s.nextSlice("\x1b[>1;2:1:1;2:4:6 q\x1b[>30;2:1:2:3 q");
+    try state.update(alloc, &t);
+    try testing.expectEqual(generation, state.extra_cursors.generation);
+    try testing.expectEqual(RenderState.Dirty.false, state.dirty);
+
+    // A real change dirties the frame even though no row changed.
+    s.nextSlice("\x1b[>0;4 q");
+    try state.update(alloc, &t);
+    try testing.expectEqual(0, state.extra_cursors.list.items.len);
+    try testing.expectEqual(RenderState.Dirty.partial, state.dirty);
+}
+
+test "extra cursors in a scrolled viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // One row of scrollback, then a cursor on each active row.
+    s.nextSlice("A\r\nB\r\n");
+    s.nextSlice("\x1b[>1;2:1:1;2:2:2 q");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(kitty_cursors.Cursor, &.{
+        .{ .x = 0, .y = 0, .shape = .block },
+        .{ .x = 1, .y = 1, .shape = .block },
+    }, state.extra_cursors.list.items);
+
+    // Scrolling back a row pushes active row zero to viewport row one
+    // and clips active row one out of the viewport entirely.
+    t.scrollViewport(.{ .delta = -1 });
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(kitty_cursors.Cursor, &.{
+        .{ .x = 0, .y = 1, .shape = .block },
+    }, state.extra_cursors.list.items);
+
+    t.scrollViewport(.bottom);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(kitty_cursors.Cursor, &.{
+        .{ .x = 0, .y = 0, .shape = .block },
+        .{ .x = 1, .y = 1, .shape = .block },
+    }, state.extra_cursors.list.items);
+}
+
 test "dirty row resets highlights" {
     const testing = std.testing;
     const alloc = testing.allocator;
