@@ -444,3 +444,278 @@ pub const RegionIterator = struct {
         }
     }
 };
+
+/// One lazily allocated cursor shape per active-screen cell.
+///
+/// This is a grid, not a list of positions, because the protocol
+/// addresses cells. A paint is a write over a row slice, an erase is the
+/// same write with `.none`, and the whole structure costs one allocation
+/// the first time the protocol is used. A list would be smaller for the
+/// handful of cursors a client usually has, but it would have to splice
+/// sorted ranges on every update, and it is *larger* for the
+/// full-screen paints this protocol makes trivial to ask for.
+pub const State = struct {
+    /// Row-major, `cols * rows` entries, or empty before the protocol is
+    /// first used. `.none` means no cursor on that cell.
+    shapes: std.ArrayListUnmanaged(Shape) = .empty,
+
+    /// How many entries in `shapes` aren't `.none`. Readers use it to
+    /// size a copy, to bound an iteration, and to skip the scan
+    /// altogether when there is nothing to find.
+    count: usize = 0,
+
+    cols: size.CellCountInt = 0,
+    rows: size.CellCountInt = 0,
+
+    /// The shared colors. Unlike positions these are terminal-wide and
+    /// survive a screen buffer switch, matching kitty.
+    text_color: Color = .unset,
+    cursor_color: Color = .unset,
+
+    /// Monotonic mutation stamp. Render snapshots compare this instead
+    /// of consuming a dirty bit, which keeps multiple readers correct
+    /// and stops an unchanged frame from rescanning the grid.
+    generation: u64 = 0,
+
+    pub fn deinit(self: *State, alloc: Allocator) void {
+        self.shapes.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Remove all cursors, keeping the colors.
+    pub fn clear(self: *State) void {
+        if (self.count == 0) return;
+        @memset(self.shapes.items, .none);
+        self.count = 0;
+        self.touch();
+    }
+
+    /// Remove all cursors and restore the default colors.
+    pub fn reset(self: *State) void {
+        const changed = self.count > 0 or
+            !self.text_color.eql(.unset) or
+            !self.cursor_color.eql(.unset);
+        if (self.count > 0) @memset(self.shapes.items, .none);
+        self.count = 0;
+        self.text_color = .unset;
+        self.cursor_color = .unset;
+        if (changed) self.touch();
+    }
+
+    /// Resize the grid. Every cursor goes, because the cells they named
+    /// are gone; the colors stay. The capacity is kept, so this needs no
+    /// allocator and cannot fail.
+    pub fn resize(
+        self: *State,
+        cols: size.CellCountInt,
+        rows: size.CellCountInt,
+    ) void {
+        if (cols == self.cols and rows == self.rows) return;
+        self.cols = cols;
+        self.rows = rows;
+        self.shapes.clearRetainingCapacity();
+        if (self.count == 0) return;
+        self.count = 0;
+        self.touch();
+    }
+
+    /// Apply a state-changing command. `cursor` is the main cursor's
+    /// position, which coordinate type 0 targets.
+    pub fn apply(
+        self: *State,
+        alloc: Allocator,
+        update: Update,
+        cursor: Coordinate,
+    ) Allocator.Error!void {
+        const changed = switch (update.operation) {
+            .paint => |shape| try self.applyPaint(alloc, update, shape, cursor),
+            .text_color => applyColor(update, &self.text_color),
+            .cursor_color => applyColor(update, &self.cursor_color),
+        };
+        if (changed) self.touch();
+    }
+
+    fn applyPaint(
+        self: *State,
+        alloc: Allocator,
+        update: Update,
+        shape: Shape,
+        cursor: Coordinate,
+    ) Allocator.Error!bool {
+        const cols: usize = @intCast(self.cols);
+        const rows: usize = @intCast(self.rows);
+        const total_cells = cols * rows;
+        if (total_cells == 0) return false;
+
+        if (self.shapes.items.len == 0) {
+            // Nothing has ever been painted, so there is nothing to
+            // erase and no reason to allocate the grid yet.
+            if (shape == .none) return false;
+
+            // The only allocation in the whole apply, and it happens
+            // before anything is mutated. A failure here leaves the
+            // state as it was.
+            try self.shapes.resize(alloc, total_cells);
+            @memset(self.shapes.items, .none);
+        }
+
+        var changed = false;
+        var regions = update.regions();
+        while (regions.next()) |region| {
+            const area = self.clipRegion(region, cursor) orelse continue;
+            for (area.top..@as(usize, area.bottom) + 1) |y| {
+                const row = self.shapes.items[y * cols ..];
+                for (row[area.left .. @as(usize, area.right) + 1]) |*cell| {
+                    // A client that redraws every frame repaints cells
+                    // that already have this shape. Skipping those
+                    // keeps the generation from ticking and forcing a
+                    // needless render.
+                    if (cell.* == shape) continue;
+                    if (cell.* == .none) self.count += 1;
+                    if (shape == .none) self.count -= 1;
+                    cell.* = shape;
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    fn applyColor(update: Update, slot: *Color) bool {
+        var changed = false;
+        var groups = update.groups();
+        while (groups.next()) |group| {
+            const value = Color.decode(group[0], group[1..]) orelse continue;
+            if (slot.eql(value)) continue;
+            slot.* = value;
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// Clip a region to the grid. Null means the region misses the
+    /// screen entirely. The spec asks us to ignore those, not clamp
+    /// them.
+    fn clipRegion(
+        self: *const State,
+        region: Region,
+        cursor: Coordinate,
+    ) ?Bounds {
+        assert(self.cols > 0 and self.rows > 0);
+        return switch (region) {
+            .cursor => cursor: {
+                const x = @min(cursor.x, self.cols - 1);
+                const y: size.CellCountInt = @intCast(@min(
+                    cursor.y,
+                    self.rows - 1,
+                ));
+                break :cursor .{ .top = y, .bottom = y, .left = x, .right = x };
+            },
+
+            // Coordinates are one-based, so zero is invalid. Everything
+            // else is clipped to the screen and rejected if it comes
+            // out empty. That covers an out of range origin too.
+            .rect => |r| rect: {
+                if (r.top == 0 or r.left == 0 or
+                    r.bottom == 0 or r.right == 0) break :rect null;
+
+                const clipped: Bounds = .{
+                    .top = r.top - 1,
+                    .left = r.left - 1,
+                    .bottom = @min(r.bottom - 1, self.rows - 1),
+                    .right = @min(r.right - 1, self.cols - 1),
+                };
+                break :rect if (clipped.top > clipped.bottom or
+                    clipped.left > clipped.right) null else clipped;
+            },
+        };
+    }
+
+    /// Iterate the live cursors in row-major order. The spec leaves the
+    /// set unordered, but a query response has to pick an order, and
+    /// row-major is the order the grid is already in.
+    pub fn iterator(self: *const State) Iterator {
+        return .{ .state = self, .remaining = self.count };
+    }
+
+    /// A row-major scan of the grid that yields only the live cursors.
+    pub const Iterator = struct {
+        state: *const State,
+        index: usize = 0,
+
+        /// Live cursors not yet yielded. The grid has `cols * rows`
+        /// entries and almost always holds a handful of cursors, so the
+        /// scan stops as soon as it has found them all.
+        remaining: usize,
+
+        pub fn next(self: *Iterator) ?Cursor {
+            if (self.remaining == 0) return null;
+            const shapes = self.state.shapes.items;
+            while (self.index < shapes.len) {
+                const index = self.index;
+                self.index += 1;
+                if (shapes[index] == .none) continue;
+                self.remaining -= 1;
+                return .{
+                    .x = @intCast(index % self.state.cols),
+                    .y = @intCast(index / self.state.cols),
+                    .shape = shapes[index],
+                };
+            }
+            return null;
+        }
+    };
+
+    /// Encode the reply to a query. Coordinates go out one-based, the
+    /// same way they come in.
+    pub fn writeResponse(
+        self: *const State,
+        query: Query,
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        switch (query) {
+            .support => try w.writeAll(support_response),
+
+            // Every cursor as `SHAPE:2:y:x`, one-based.
+            .cursors => {
+                try w.writeAll("\x1b[>100");
+                var it = self.iterator();
+                while (it.next()) |c| try w.print(";{d}:2:{d}:{d}", .{
+                    @intFromEnum(c.shape),
+                    @as(u32, c.y) + 1,
+                    @as(u32, c.x) + 1,
+                });
+                try w.writeAll(" q");
+            },
+
+            .colors => {
+                try w.writeAll("\x1b[>101;30:");
+                try self.text_color.encode(w);
+                try w.writeAll(";40:");
+                try self.cursor_color.encode(w);
+                try w.writeAll(" q");
+            },
+        }
+    }
+
+    /// Encode a query response into memory owned by the caller. Both
+    /// stream handlers need this; only how they send it differs.
+    pub fn allocResponse(
+        self: *const State,
+        alloc: Allocator,
+        query: Query,
+    ) Allocator.Error![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        errdefer aw.deinit();
+        self.writeResponse(query, &aw.writer) catch return error.OutOfMemory;
+        return aw.toOwnedSlice();
+    }
+
+    /// Note a mutation. Zero is reserved to mean "never mutated", so a
+    /// fresh render snapshot always disagrees with a state someone has
+    /// touched, even once the counter wraps.
+    fn touch(self: *State) void {
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
