@@ -5,6 +5,7 @@ const xev = global.xev;
 const wuffs = @import("wuffs");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
+const TerminalColor = configpkg.Config.TerminalColor;
 const font = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");
 const os = @import("../os/main.zig");
@@ -1617,14 +1618,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
-                // Build our GPU cells
+                // Build our GPU cells. Resolve cursor visibility once
+                // here and hand it down whole. The main cursor's style
+                // and whether the kitty extras are drawn are two answers
+                // from the same priority list.
+                const cursor_visibility: renderer.CursorStyleOptions = .{
+                    .preedit = critical.preedit != null,
+                    .focused = self.focused,
+                    .blink_visible = cursor_blink_visible,
+                };
                 self.rebuildCells(
                     critical.preedit,
-                    renderer.cursorStyle(&self.terminal_state, .{
-                        .preedit = critical.preedit != null,
-                        .focused = self.focused,
-                        .blink_visible = cursor_blink_visible,
-                    }),
+                    renderer.cursorStyle(
+                        &self.terminal_state,
+                        cursor_visibility,
+                    ),
+                    cursor_visibility,
                     &critical.links,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
@@ -1845,7 +1854,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            const fg_count = upload: {
+                // Extra block cursors recolor the text they cover, but
+                // only for the upload. Later frames reuse the row caches
+                // for clean rows.
+                self.cells.swapCursorText();
+                defer self.cells.swapCursorText();
+                break :upload try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            };
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -2438,7 +2454,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 0,
             };
 
-            if (self.cells.getCursorGlyph()) |cursor| {
+            if (self.cells.main_cursor) |cursor| {
                 const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
                 const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
 
@@ -2599,9 +2615,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
+            cursor_visibility: renderer.CursorStyleOptions,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
+
+            // Bold color handling is renderer configuration, not
+            // terminal state, so the render state cannot fill it in
+            // itself. See `Colors.bold`.
+            state.colors.bold = self.config.bold_color;
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -2728,135 +2750,98 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our cursor rendering information.
             cursor: {
                 // Clear our cursor by default.
-                self.cells.setCursor(null, null);
+                self.cells.clearCursor();
                 self.uniforms.cursor_pos = .{
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
                 };
 
-                // If the cursor isn't visible on the viewport, don't show
-                // a cursor. Otherwise, get our cursor cell, because we may
-                // need it for styling.
-                const cursor_vp = state.cursor.viewport orelse break :cursor;
-                const cursor_style: terminal.Style = cursor_style: {
-                    const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
-                    break :cursor_style if (cell.raw.hasStyling())
-                        cell.style
+                // Preedit takes over the cursor cell entirely. The main
+                // cursor is not drawn there, even though `cursorStyle`
+                // reports a block for it.
+                const main_style = if (preedit != null) null else cursor_style_;
+                if (main_style == null and
+                    state.extra_cursors.list.items.len == 0) break :cursor;
+
+                // The main cursor's colors. Extra cursors inherit them,
+                // so they are resolved even when DECTCEM, focus, or
+                // preedit has hidden the main cursor.
+                const cursor_colors = self.cursorColors(
+                    if (state.cursor.viewport) |vp|
+                        state.paintedAt(vp.x, vp.y)
                     else
-                        .{};
-                };
-
-                // If we have preedit text, we don't setup a cursor
-                if (preedit != null) break :cursor;
-
-                // If there isn't a cursor visual style requested then
-                // we don't render a cursor.
-                const style = cursor_style_ orelse break :cursor;
-
-                // Determine the cursor color.
-                const cursor_color = cursor_color: {
-                    // If an explicit cursor color was set by OSC 12, use that.
-                    if (state.colors.cursor) |v| break :cursor_color v;
-
-                    // Use our configured color if specified
-                    if (self.config.cursor_color) |v| switch (v) {
-                        .color => |color| break :cursor_color color.toTerminalRGB(),
-
-                        inline .@"cell-foreground",
-                        .@"cell-background",
-                        => |_, tag| {
-                            const fg_style = cursor_style.fg(.{
-                                .default = state.colors.foreground,
-                                .palette = &state.colors.palette,
-                                .bold = self.config.bold_color,
-                            });
-                            const bg_style = cursor_style.bg(
-                                &state.cursor.cell,
-                                &state.colors.palette,
-                            ) orelse state.colors.background;
-
-                            break :cursor_color switch (tag) {
-                                .color => unreachable,
-                                .@"cell-foreground" => if (cursor_style.flags.inverse)
-                                    bg_style
-                                else
-                                    fg_style,
-                                .@"cell-background" => if (cursor_style.flags.inverse)
-                                    fg_style
-                                else
-                                    bg_style,
-                            };
-                        },
-                    };
-
-                    break :cursor_color state.colors.foreground;
-                };
-
-                self.addCursor(
-                    &state.cursor,
-                    style,
-                    cursor_color,
+                        null,
                 );
 
-                // If the cursor is visible then we set our uniforms.
-                if (style == .block) {
-                    const wide = state.cursor.cell.wide;
+                // Preedit glyphs are appended after their row is built
+                // and leave it out of column order, so `addCursorText`
+                // must never be asked for that row. See its doc comment.
+                const preedit_row: ?terminal.size.CellCountInt = if (preedit) |_|
+                    if (state.cursor.viewport) |vp| vp.y else null
+                else
+                    null;
 
-                    self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
-                        },
-                        @intCast(cursor_vp.y),
-                    };
+                var cursors: renderer.Cursors = .init(state, .{
+                    .colors = cursor_colors,
+                    .style = main_style,
+                    .visibility = cursor_visibility,
+                });
 
-                    self.uniforms.bools.cursor_wide = switch (wide) {
-                        .narrow, .spacer_head => false,
-                        .wide, .spacer_tail => true,
-                    };
+                const alpha: u8 = if (!self.focused)
+                    255
+                else
+                    @intFromFloat(@ceil(255 * self.config.cursor_opacity));
 
-                    const uniform_color = if (self.config.cursor_text) |txt| blk: {
-                        // If cursor-text is set, then compute the correct color.
-                        // Otherwise, use the background color.
-                        if (txt == .color) {
-                            // Use the color set by cursor-text, if any.
-                            break :blk txt.color.toTerminalRGB();
-                        }
+                var sprites: SpriteCache = .empty;
 
-                        const fg_style = cursor_style.fg(.{
-                            .default = state.colors.foreground,
-                            .palette = &state.colors.palette,
-                            .bold = self.config.bold_color,
-                        });
-                        const bg_style = cursor_style.bg(
-                            &state.cursor.cell,
-                            &state.colors.palette,
-                        ) orelse state.colors.background;
+                if (cursors.main) |main| main: {
+                    const glyph = self.cursorGlyph(main.wide, main.style) orelse
+                        break :main;
 
-                        break :blk switch (txt) {
-                            // If the cell is reversed, use the opposite cell color instead.
-                            .@"cell-foreground" => if (cursor_style.flags.inverse)
-                                bg_style
-                            else
-                                fg_style,
-                            .@"cell-background" => if (cursor_style.flags.inverse)
-                                fg_style
-                            else
-                                bg_style,
-                            else => unreachable,
+                    // A narrow main cursor uses the same sprite an extra
+                    // cursor of that style would. Seed the cache with it
+                    // and the extras skip a font grid lock.
+                    if (!main.wide) sprites.seed(main.style, glyph);
+
+                    const vertex = cursorVertex(main, glyph, alpha);
+                    self.addCursor(vertex, main.style, .main);
+
+                    // Only the main cursor drives the shader uniforms.
+                    // An extra cursor must never turn up as
+                    // iCurrentCursor.
+                    if (main.style == .block) {
+                        self.uniforms.cursor_pos = .{ main.x, main.y };
+                        self.uniforms.bools.cursor_wide = main.wide;
+                        self.uniforms.cursor_color = .{
+                            main.colors.text.r,
+                            main.colors.text.g,
+                            main.colors.text.b,
+                            255,
                         };
-                    } else state.colors.background;
+                    }
+                }
 
-                    self.uniforms.cursor_color = .{
-                        uniform_color.r,
-                        uniform_color.g,
-                        uniform_color.b,
-                        255,
-                    };
+                while (cursors.next()) |extra| {
+                    const glyph = sprites.get(self, extra.style) orelse continue;
+                    self.addCursor(
+                        cursorVertex(extra, glyph, alpha),
+                        extra.style,
+                        .extra,
+                    );
+
+                    // Only a block covers the text under it, and only a
+                    // block recolors it.
+                    if (extra.style == .block and extra.y != preedit_row) {
+                        self.cells.addCursorText(
+                            self.alloc,
+                            extra.x,
+                            extra.y,
+                            extra.colors.text,
+                        ) catch |err| log.warn(
+                            "error adding extra cursor text err={}",
+                            .{err},
+                        );
+                    }
                 }
             }
 
@@ -3068,93 +3053,66 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :selected .false;
                 };
 
-                // The `_style` suffixed values are the colors based on
-                // the cell style (SGR), before applying any additional
-                // configuration, inversions, selections, etc.
-                const bg_style = style.bg(
-                    cell,
-                    &state.colors.palette,
-                );
-                const fg_style = style.fg(.{
-                    .default = state.colors.foreground,
-                    .palette = &state.colors.palette,
-                    .bold = self.config.bold_color,
-                });
+                // The cell's own colors. `styled` holds them as the SGR
+                // state names them. `painted` is the pair as it is
+                // drawn: `inverse` applied, default background filled
+                // in. Every `cell-foreground` and `cell-background`
+                // option below means the painted pair, so none of them
+                // has to spell out the inversion.
+                const styled = state.colors.styled(style, cell);
+                const painted = styled.paint(state.colors.background);
 
                 // The final background color for the cell.
-                const bg = switch (selected) {
-                    // If we have an explicit selection background color
-                    // specified in the config, use that.
-                    //
+                const bg: ?terminal.color.RGB = switch (selected) {
                     // If no configuration, then our selection background
                     // is our foreground color.
-                    .selection => if (self.config.selection_background) |v| switch (v) {
-                        .color => |color| color.toTerminalRGB(),
-                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
-                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
-                    } else state.colors.foreground,
-
-                    .search => switch (self.config.search_background) {
-                        .color => |color| color.toTerminalRGB(),
-                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
-                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
-                    },
-
-                    .search_selected => switch (self.config.search_selected_background) {
-                        .color => |color| color.toTerminalRGB(),
-                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
-                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
-                    },
-
-                    // Not selected
-                    .false => if (style.flags.inverse != isCovering(cell.codepoint()))
-                        // Two cases cause us to invert (use the fg color as the bg)
-                        // - The "inverse" style flag.
-                        // - A "covering" glyph; we use fg for bg in that
-                        //   case to help make sure that padding extension
-                        //   works correctly.
-                        //
-                        // If one of these is true (but not the other)
-                        // then we use the fg style color for the bg.
-                        fg_style
+                    .selection => if (self.config.selection_background) |v|
+                        TerminalColor.resolve(v, painted, state.colors.foreground)
                     else
-                        // Otherwise they cancel out.
-                        bg_style,
+                        state.colors.foreground,
+
+                    .search => TerminalColor.resolve(
+                        self.config.search_background,
+                        painted,
+                        state.colors.foreground,
+                    ),
+
+                    .search_selected => TerminalColor.resolve(
+                        self.config.search_selected_background,
+                        painted,
+                        state.colors.foreground,
+                    ),
+
+                    // A "covering" glyph inverts the cell on top of
+                    // whatever `inverse` did, so that padding extension
+                    // picks up the color the glyph fills with. Two
+                    // inversions cancel; swapping the painted pair says
+                    // that in one line.
+                    .false => if (isCovering(cell.codepoint()))
+                        painted.foreground
+                    else
+                        painted.background,
                 };
 
-                const fg = fg: {
-                    // Our happy-path non-selection background color
-                    // is our style or our configured defaults.
-                    const final_bg = bg_style orelse state.colors.background;
+                const fg = switch (selected) {
+                    .selection => if (self.config.selection_foreground) |v|
+                        TerminalColor.resolve(v, painted, state.colors.background)
+                    else
+                        state.colors.background,
 
-                    // Whether we need to use the bg color as our fg color:
-                    // - Cell is selected, inverted, and set to cell-foreground
-                    // - Cell is selected, not inverted, and set to cell-background
-                    // - Cell is inverted and not selected
-                    break :fg switch (selected) {
-                        .selection => if (self.config.selection_foreground) |v| switch (v) {
-                            .color => |color| color.toTerminalRGB(),
-                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
-                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
-                        } else state.colors.background,
+                    .search => TerminalColor.resolve(
+                        self.config.search_foreground,
+                        painted,
+                        state.colors.background,
+                    ),
 
-                        .search => switch (self.config.search_foreground) {
-                            .color => |color| color.toTerminalRGB(),
-                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
-                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
-                        },
+                    .search_selected => TerminalColor.resolve(
+                        self.config.search_selected_foreground,
+                        painted,
+                        state.colors.background,
+                    ),
 
-                        .search_selected => switch (self.config.search_selected_foreground) {
-                            .color => |color| color.toTerminalRGB(),
-                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
-                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
-                        },
-
-                        .false => if (style.flags.inverse)
-                            final_bg
-                        else
-                            fg_style,
-                    };
+                    .false => painted.foreground,
                 };
 
                 // Foreground alpha for this cell.
@@ -3178,14 +3136,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (style.flags.inverse) break :bg_alpha default;
 
                         // If the user requested to have opacity on all cells, apply it.
-                        if (self.config.background_opacity_cells and bg_style != null) {
+                        if (self.config.background_opacity_cells and
+                            styled.background != null)
+                        {
                             var opacity: f64 = @floatFromInt(default);
                             opacity *= self.config.background_opacity;
                             break :bg_alpha @intFromFloat(opacity);
                         }
 
                         // Cells that have an explicit bg color should be fully opaque.
-                        if (bg_style != null) break :bg_alpha default;
+                        if (styled.background != null) break :bg_alpha default;
 
                         // Otherwise, we won't draw the bg for this cell,
                         // we'll let the already-drawn background color
@@ -3504,34 +3464,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
         }
 
-        fn addCursor(
+        /// Build a vertex for a resolved cursor sprite.
+        fn cursorVertex(
+            cursor: renderer.Cursor,
+            render: font.SharedGrid.Render,
+            alpha: u8,
+        ) shaderpkg.CellText {
+            return .{
+                .atlas = .grayscale,
+                .bools = .{ .is_cursor_glyph = true },
+                .grid_pos = .{ cursor.x, cursor.y },
+                .color = .{
+                    cursor.colors.cursor.r,
+                    cursor.colors.cursor.g,
+                    cursor.colors.cursor.b,
+                    alpha,
+                },
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
+                .bearings = .{
+                    @intCast(render.glyph.offset_x),
+                    @intCast(render.glyph.offset_y),
+                },
+            };
+        }
+
+        /// Resolve a cursor sprite from the shared font grid. Callers that
+        /// draw many cursors of the same style can reuse the result for
+        /// the frame instead of taking the shared lock for each one.
+        fn cursorGlyph(
             self: *Self,
-            cursor_state: *const terminal.RenderState.Cursor,
+            wide: bool,
             cursor_style: renderer.CursorStyle,
-            cursor_color: terminal.color.RGB,
-        ) void {
-            const cursor_vp = cursor_state.viewport orelse return;
-
-            // Add the cursor. We render the cursor over the wide character if
-            // we're on the wide character tail.
-            const wide, const x = cell: {
-                // The cursor goes over the screen cursor position.
-                if (!cursor_vp.wide_tail) break :cell .{
-                    cursor_state.cell.wide == .wide,
-                    cursor_vp.x,
-                };
-
-                // If we're part of a wide character, we move the cursor back
-                // to the actual character.
-                break :cell .{ true, cursor_vp.x - 1 };
-            };
-
-            const alpha: u8 = if (!self.focused) 255 else alpha: {
-                const alpha = 255 * self.config.cursor_opacity;
-                break :alpha @intFromFloat(@ceil(alpha));
-            };
-
-            const render = switch (cursor_style) {
+        ) ?font.SharedGrid.Render {
+            return switch (cursor_style) {
                 .block,
                 .block_hollow,
                 .bar,
@@ -3555,7 +3521,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                     ) catch |err| {
                         log.warn("error rendering cursor glyph err={}", .{err});
-                        return;
+                        return null;
                     };
                 },
 
@@ -3570,28 +3536,117 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     },
                 ) catch |err| {
                     log.warn("error rendering cursor glyph err={}", .{err});
-                    return;
+                    return null;
                 } orelse {
                     // This should never happen because we embed nerd
                     // fonts so we just log and return instead of fallback.
                     log.warn("failed to find lock symbol for cursor codepoint=0xF023", .{});
-                    return;
+                    return null;
                 },
             };
-
-            self.cells.setCursor(.{
-                .atlas = .grayscale,
-                .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
-                .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
-                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
-                .glyph_size = .{ render.glyph.width, render.glyph.height },
-                .bearings = .{
-                    @intCast(render.glyph.offset_x),
-                    @intCast(render.glyph.offset_y),
-                },
-            }, cursor_style);
         }
+
+        /// Add a cursor vertex to the cell contents. Every cursor comes
+        /// through here, so they share draw ordering and the main cursor
+        /// is recorded in exactly one place.
+        fn addCursor(
+            self: *Self,
+            cell: shaderpkg.CellText,
+            cursor_style: renderer.CursorStyle,
+            role: cellpkg.Contents.CursorRole,
+        ) void {
+            self.cells.addCursor(
+                self.alloc,
+                cell,
+                cursor_style,
+                role,
+            ) catch |err| {
+                // A cursor glyph is best-effort. A frame missing one
+                // beats a failed render.
+                log.warn("error adding cursor glyph err={}", .{err});
+            };
+        }
+
+        /// Resolve both of the main cursor's colors once.
+        ///
+        /// Extra cursors inherit this pair wherever the kitty protocol
+        /// leaves a color unset, so it is resolved even on a frame that
+        /// doesn't draw the main cursor.
+        ///
+        /// `cell` is the drawn colors of the cell the cursor sits on:
+        /// what the `cell-foreground` and `cell-background` options
+        /// name. It is null when the cursor is out of the viewport,
+        /// where those options have nothing to refer to.
+        fn cursorColors(
+            self: *Self,
+            cell: ?terminal.color.Pair,
+        ) renderer.Cursor.Colors {
+            const colors = &self.terminal_state.colors;
+            return .{
+                // OSC 12 overrides the static cursor configuration.
+                .cursor = colors.cursor orelse TerminalColor.resolve(
+                    self.config.cursor_color,
+                    cell,
+                    colors.foreground,
+                ),
+                .text = TerminalColor.resolve(
+                    self.config.cursor_text,
+                    cell,
+                    colors.background,
+                ),
+            };
+        }
+
+        /// Cursor sprites resolved on demand and shared by every cursor
+        /// of the same style in a frame. However many cursors are drawn,
+        /// the shared font grid is locked at most once per style.
+        const SpriteCache = struct {
+            entries: std.enums.EnumArray(renderer.CursorStyle, Entry),
+
+            const Entry = union(enum) {
+                /// Not looked up yet this frame.
+                unresolved,
+                /// Looked up and failed. Kept so a grid that cannot
+                /// produce this sprite is asked once, not once per
+                /// cursor.
+                missing,
+                ready: font.SharedGrid.Render,
+            };
+
+            const empty: SpriteCache = .{ .entries = .initFill(.unresolved) };
+
+            /// Record a sprite that was resolved elsewhere.
+            fn seed(
+                self: *SpriteCache,
+                cursor_style: renderer.CursorStyle,
+                render: font.SharedGrid.Render,
+            ) void {
+                self.entries.set(cursor_style, .{ .ready = render });
+            }
+
+            /// The sprite for a style, resolving it against the font
+            /// grid the first time it is asked for.
+            fn get(
+                self: *SpriteCache,
+                r: *Self,
+                cursor_style: renderer.CursorStyle,
+            ) ?font.SharedGrid.Render {
+                switch (self.entries.get(cursor_style)) {
+                    .ready => |render| return render,
+                    .missing => return null,
+                    .unresolved => {},
+                }
+
+                // Extra cursors are always one cell wide. See
+                // `renderer.Cursors`.
+                const render = r.cursorGlyph(false, cursor_style);
+                self.entries.set(cursor_style, if (render) |v|
+                    .{ .ready = v }
+                else
+                    .missing);
+                return render;
+            }
+        };
 
         fn addPreeditCell(
             self: *Self,
