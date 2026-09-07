@@ -206,3 +206,241 @@ pub const Cursor = struct {
     y: size.CellCountInt,
     shape: Shape,
 };
+
+/// A decoded command. Queries are kept apart from updates so the common
+/// update path never has to think about building a response.
+pub const Command = union(enum) {
+    query: Query,
+    update: Update,
+
+    /// Decode a CSI dispatch, or null if it isn't this protocol.
+    ///
+    /// An operation with no coordinate groups behind it becomes an
+    /// `Update` that targets nothing, so `CSI > 1 SP q` is accepted and
+    /// paints nowhere. The protocol defines no default region, and
+    /// guessing one would paint somewhere nobody asked for.
+    pub fn decode(input: Parser.Action.CSI) ?Command {
+        if (input.final != 'q' or
+            !std.mem.eql(u8, input.intermediates, "> ")) return null;
+
+        if (input.params.len == 0) return .{ .query = .support };
+        if (input.params.len == 1) {
+            if (Query.decode(input.params[0])) |query| {
+                return .{ .query = query };
+            }
+        }
+
+        return .{ .update = .{
+            .operation = Operation.decode(input.params[0]) orelse return null,
+            .params = input.params,
+            .params_sep = input.params_sep,
+        } };
+    }
+
+    /// The C API view of a decoded command.
+    ///
+    /// The Zig union nests the operation inside `update`, and a C caller
+    /// can't switch on that. `kind` flattens both levels into one tag,
+    /// and `shape` carries what `paint` held.
+    pub const C = extern struct {
+        kind: Kind,
+
+        /// The shape to paint. Only meaningful when `kind` is `.paint`.
+        shape: Shape,
+
+        /// The CSI parameters, borrowed from the parser. Index 0 is the
+        /// operation number that `kind` and `shape` decode; the rest are
+        /// the coordinates or colors it applies to.
+        params: [*]const u16,
+        params_len: usize,
+
+        /// One bit per parameter, set when a ':' follows that parameter
+        /// instead of a ';'. Parameter i is bit `i % 8` of byte `i / 8`.
+        /// A byte array, not the Zig bit set, so the layout is well
+        /// defined for C.
+        params_sep: [Parser.MAX_PARAMS / 8]u8,
+
+        pub const Kind = enum(u8) {
+            query_support,
+            query_cursors,
+            query_colors,
+            paint,
+            text_color,
+            cursor_color,
+        };
+    };
+
+    /// The C API representation. The parameters stay borrowed, so this
+    /// is valid for exactly as long as the command it came from.
+    pub fn cval(self: Command) C {
+        var result: C = .{
+            .kind = undefined,
+            .shape = .none,
+            .params = (&[_]u16{}).ptr,
+            .params_len = 0,
+            .params_sep = @splat(0),
+        };
+
+        switch (self) {
+            .query => |q| result.kind = switch (q) {
+                .support => .query_support,
+                .cursors => .query_cursors,
+                .colors => .query_colors,
+            },
+
+            .update => |u| {
+                switch (u.operation) {
+                    .paint => |shape| {
+                        result.kind = .paint;
+                        result.shape = shape;
+                    },
+                    .text_color => result.kind = .text_color,
+                    .cursor_color => result.kind = .cursor_color,
+                }
+
+                result.params = u.params.ptr;
+                result.params_len = u.params.len;
+                var it = u.params_sep.iterator(.{});
+                while (it.next()) |i| {
+                    result.params_sep[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+                }
+            },
+        }
+
+        return result;
+    }
+};
+
+/// The borrowed payload of a state-changing command, valid only for the
+/// duration of the stream callback that received it.
+pub const Update = struct {
+    operation: Operation,
+
+    /// The CSI parameters, with the operation still at index 0 so the
+    /// separator bits line up with them. Iterate with `groups` or
+    /// `regions`; don't index this directly.
+    params: []const u16,
+    params_sep: *const Parser.Action.CSI.SepList,
+
+    /// Iterate the semicolon-delimited groups after the operation. This
+    /// is for the color operations; paint operations use `regions`.
+    pub fn groups(self: Update) Parser.Action.CSI.GroupIterator {
+        var it: Parser.Action.CSI.GroupIterator = .{
+            .params = self.params,
+            .params_sep = self.params_sep,
+        };
+
+        // Drop the operation, which is a group of its own. Skip a whole
+        // group, not one parameter: malformed input that colon-joins
+        // the operation to what follows would otherwise leave those
+        // parameters behind to be read as a coordinate.
+        _ = it.next();
+        return it;
+    }
+
+    /// Iterate the screen regions targeted by a paint operation.
+    pub fn regions(self: Update) RegionIterator {
+        return .{ .groups = self.groups() };
+    }
+};
+
+/// How a paint operation addresses cells. Protocol values not represented
+/// here are ignored.
+const CoordinateType = enum(u16) {
+    cursor = 0,
+    point = 2,
+    rectangle = 4,
+};
+
+/// A one-based, inclusive screen rectangle exactly as it was sent.
+pub const Rect = struct {
+    top: u16,
+    left: u16,
+    bottom: u16,
+    right: u16,
+};
+
+/// A zero-based, inclusive grid rectangle, already clipped to the screen
+/// and so covering at least one cell. It is a separate type from `Rect`
+/// because the two coordinate spaces are one apart, and mixing them up
+/// is the easiest mistake this protocol offers.
+const Bounds = struct {
+    top: size.CellCountInt,
+    left: size.CellCountInt,
+    bottom: size.CellCountInt,
+    right: size.CellCountInt,
+};
+
+/// A paint target. A point becomes a 1x1 rectangle, so consumers have
+/// only one geometric case.
+pub const Region = union(enum) {
+    /// The main cursor's cell (coordinate type 0).
+    cursor,
+    /// Coordinate type 2 (a point) or 4 (a rectangle).
+    rect: Rect,
+};
+
+/// Decodes the coordinate groups of a paint operation into regions.
+///
+/// Trailing coordinates that don't complete a region are ignored, as the
+/// spec requires, and so are unknown coordinate types.
+pub const RegionIterator = struct {
+    groups: Parser.Action.CSI.GroupIterator,
+
+    /// Coordinates of the current group not yet yielded, and how many of
+    /// them each region takes: two for a point, four for a rectangle.
+    rest: []const u16 = &.{},
+    stride: usize = 4,
+
+    /// A bare coordinate type 4 means the whole screen. `clipRegion`
+    /// clamps this to the grid, so it needs no case of its own.
+    const all: Rect = .{
+        .top = 1,
+        .left = 1,
+        .bottom = std.math.maxInt(u16),
+        .right = std.math.maxInt(u16),
+    };
+
+    pub fn next(self: *RegionIterator) ?Region {
+        while (true) {
+            // A point repeats its own coordinates for the far corner.
+            // That is what lets both strides share one expression.
+            if (self.rest.len >= self.stride) {
+                const c = self.rest;
+                self.rest = c[self.stride..];
+                return .{ .rect = .{
+                    .top = c[0],
+                    .left = c[1],
+                    .bottom = c[self.stride - 2],
+                    .right = c[self.stride - 1],
+                } };
+            }
+
+            // Whatever is left of the previous group is an incomplete
+            // region, which the spec says to ignore.
+            const group = self.groups.next() orelse return null;
+            self.rest = &.{};
+
+            switch (std.enums.fromInt(
+                CoordinateType,
+                group[0],
+            ) orelse continue) {
+                .cursor => return .cursor,
+
+                .point => {
+                    self.stride = 2;
+                    self.rest = group[1..];
+                },
+
+                .rectangle => {
+                    self.stride = 4;
+                    // Only a bare coordinate type 4 is the whole
+                    // screen. A type 4 with too few coordinates is just
+                    // an incomplete rectangle, ignored like any other.
+                    if (group.len == 1) return .{ .rect = all };
+                    self.rest = group[1..];
+                },
+            }
+        }
+    }
+};
