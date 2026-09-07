@@ -5745,6 +5745,128 @@ test "kitty_keyboard_query" {
     try testing.expectEqualStrings("\x1b[?1u", S.written.?);
 }
 
+test "kitty cursors: updates are silent and queries observe them" {
+    const S = struct {
+        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        fn writePty(_: *Handler, data: []const u8) void {
+            pty.appendSlice(testing.allocator, data) catch unreachable;
+        }
+    };
+    S.pty = .empty;
+    defer S.pty.deinit(testing.allocator);
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 16, .rows = 8 });
+    defer t.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Discovery, two point updates, both color forms, then the queries
+    // that observe them. Only the queries write to the pty.
+    s.nextSlice(
+        "\x1b[> q" ++
+            "\x1b[>29;2:4:5;2:2:1 q" ++
+            "\x1b[>30;2:10:20:30 q" ++
+            "\x1b[>40;5:7 q" ++
+            "\x1b[>100 q" ++
+            "\x1b[>101 q",
+    );
+    try testing.expectEqual(2, t.kitty_extra_cursors.count);
+    try testing.expectEqualStrings(
+        "\x1b[>1;2;3;29;30;40;100;101 q" ++
+            "\x1b[>100;29:2:2:1;29:2:4:5 q" ++
+            "\x1b[>101;30:2:10:20:30;40:5:7 q",
+        S.pty.items,
+    );
+}
+
+test "kitty cursors: screen changes drop positions but not colors" {
+    const S = struct {
+        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        fn writePty(_: *Handler, data: []const u8) void {
+            pty.appendSlice(testing.allocator, data) catch unreachable;
+        }
+    };
+    S.pty = .empty;
+    defer S.pty.deinit(testing.allocator);
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 16, .rows = 8 });
+    defer t.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b[>30;2:10:20:30 q\x1b[>40;5:7 q");
+
+    // Every screen buffer switch and destructive erase clears the
+    // positions, and so does a resize. The spec names ED 2, 3, and 22.
+    for ([_][]const u8{
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+        "\x1b[2J",
+        "\x1b[3J",
+        "\x1b[22J",
+    }) |seq| {
+        s.nextSlice("\x1b[>2;4 q");
+        try testing.expectEqual(128, t.kitty_extra_cursors.count);
+        s.nextSlice(seq);
+        try testing.expectEqual(0, t.kitty_extra_cursors.count);
+    }
+
+    s.nextSlice("\x1b[>2;4 q");
+    try t.resize(testing.allocator, .{ .cols = 8, .rows = 4 });
+    try testing.expectEqual(0, t.kitty_extra_cursors.count);
+
+    // None of that touched the terminal-wide colors. A full reset does.
+    s.nextSlice("\x1b[>101 q");
+    try testing.expectEqualStrings(
+        "\x1b[>101;30:2:10:20:30;40:5:7 q",
+        S.pty.items,
+    );
+
+    t.fullReset();
+    S.pty.clearRetainingCapacity();
+    s.nextSlice("\x1b[>101 q");
+    try testing.expectEqualStrings("\x1b[>101;30:0;40:0 q", S.pty.items);
+}
+
+test "kitty cursors: scrolling does not move extra cursors" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&t),
+    });
+    defer s.deinit();
+
+    // A cursor on the top row and one on the bottom row.
+    s.nextSlice("\x1b[>1;2:1:1;2:3:4 q");
+    const before = try testing.allocator.dupe(
+        kitty.cursors.Shape,
+        t.kitty_extra_cursors.shapes.items,
+    );
+    defer testing.allocator.free(before);
+    try testing.expectEqual(2, t.kitty_extra_cursors.count);
+
+    // The spec is explicit that scrolling the screen contents, into
+    // scrollback or off the top, must not affect extra cursors. They
+    // stay at exactly the same screen positions. Index from the bottom
+    // row, reverse index from the top, and a plain newline.
+    s.nextSlice("\x1b[3;1H\n\x1bD");
+    s.nextSlice("\x1b[1;1H\x1bM");
+    try testing.expectEqualSlices(
+        kitty.cursors.Shape,
+        before,
+        t.kitty_extra_cursors.shapes.items,
+    );
+    try testing.expectEqual(2, t.kitty_extra_cursors.count);
+}
+
 test "xtversion default" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
