@@ -259,6 +259,71 @@ pub const RenderState = struct {
         foreground: color.RGB,
         cursor: ?color.RGB,
         palette: color.Palette,
+
+        /// How bold text picks its color.
+        ///
+        /// This is renderer configuration, not terminal state, so
+        /// `beginUpdate` never writes it. A renderer that reads painted
+        /// colors fills it in from its own config.
+        bold: ?Style.BoldColor = null,
+
+        /// A cell's own colors, resolved from its style but not yet
+        /// inverted.
+        ///
+        /// `background` is null when the cell sets none of its own. The
+        /// painted pair folds that into the terminal default, but
+        /// background opacity has to tell the two apart, so the
+        /// distinction survives this far.
+        pub const Styled = struct {
+            foreground: color.RGB,
+            background: ?color.RGB,
+            inverse: bool,
+
+            /// The colors the cell is actually drawn with. `default` is
+            /// the terminal background, standing in for a cell that set
+            /// none of its own.
+            pub fn paint(self: Styled, default: color.RGB) color.Pair {
+                const background = self.background orelse default;
+                return if (self.inverse) .{
+                    .foreground = background,
+                    .background = self.foreground,
+                } else .{
+                    .foreground = self.foreground,
+                    .background = background,
+                };
+            }
+        };
+
+        /// Resolve a cell's style against the palette and the defaults.
+        ///
+        /// `raw` comes along with `style` because the page stores a
+        /// cell's own background out of line from its style. The style
+        /// alone cannot answer for it.
+        pub fn styled(
+            self: *const Colors,
+            style: Style,
+            raw: *const page.Cell,
+        ) Styled {
+            return .{
+                .foreground = style.fg(.{
+                    .default = self.foreground,
+                    .palette = &self.palette,
+                    .bold = self.bold,
+                }),
+                .background = style.bg(raw, &self.palette),
+                .inverse = style.flags.inverse,
+            };
+        }
+
+        /// `styled` followed by `Styled.paint`, for callers that want
+        /// only the drawn pair.
+        pub fn paint(
+            self: *const Colors,
+            style: Style,
+            raw: *const page.Cell,
+        ) color.Pair {
+            return self.styled(style, raw).paint(self.background);
+        }
     };
 
     pub const Cursor = struct {
@@ -1108,6 +1173,27 @@ pub const RenderState = struct {
             }
         }
         self.pending_styles.clearRetainingCapacity();
+    }
+
+    /// The colors the cell at a viewport position is drawn with, or null
+    /// if the position is outside the row data.
+    ///
+    /// These are the colors as seen, so an inverse cell has already had
+    /// them swapped. Anything that names a cell's foreground or
+    /// background means what the user sees, and all of it comes here.
+    pub fn paintedAt(
+        self: *const RenderState,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+    ) ?color.Pair {
+        if (y >= self.row_data.len) return null;
+        const cells = self.row_data.items(.cells)[y];
+        if (x >= cells.len) return null;
+        const cell = cells.get(x);
+        return self.colors.paint(
+            if (cell.raw.hasStyling()) cell.style else .{},
+            &cell.raw,
+        );
     }
 
     /// Mark all render-state data as consumed by the renderer.
