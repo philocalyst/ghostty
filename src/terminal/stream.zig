@@ -573,7 +573,6 @@ pub fn Stream(comptime H: type) type {
             // Initialize the parser
             var parser: Parser = .init();
             if (options.allocator) |alloc| parser.setAllocator(alloc);
-            if (options.allocator) |alloc| parser.setAllocator(alloc);
             parser.osc_parser.unknown_max_bytes = options.osc_unknown_max_bytes;
 
             // Initialize the continuation tracker if one is requested.
